@@ -93,6 +93,66 @@ describe('filling a loop range', () => {
   });
 });
 
+describe('one-shots in time', () => {
+  const B = Luna.TICKS_PER_BEAT, BAR = 4 * B;
+  it('strikes once per bar, unwarped, cut short by the next hit', () => {
+    const hit = B / 2; // a short kick: an eighth note long at this tempo
+    const p = L.hitPieces(0, BAR, [[0, 3 * BAR]], hit, 250e6);
+    expect(p.map((x) => [x.startTick / BAR, x.stopTick - x.startTick, x.sourceStopNs])).toEqual([[0, hit, 250e6], [1, hit, 250e6], [2, hit, 250e6]]);
+    const long = L.hitPieces(0, B, [[0, 2 * B]], 3 * B, 3e9); // a long crash struck every beat
+    expect(long.map((x) => [x.startTick, x.stopTick - x.startTick, x.sourceStopNs])).toEqual([[0, B, 1e9], [B, B, 1e9]]);
+  });
+  it('skips the bar being played and keeps the phase of the anchor', () => {
+    const p = L.hitPieces(0, BAR, [[0, BAR], [2 * BAR, 4 * BAR]], B, 1e9);
+    expect(p.map((x) => x.startTick / BAR)).toEqual([0, 2, 3]);
+  });
+});
+
+describe('search', () => {
+  const m = (q, name) => L.matches(name, L.parseQuery(q));
+  it('spaces mean all words', () => {
+    expect(m('kick 808', '808 Kick Hard.wav')).toBe(true);
+    expect(m('kick 808', 'Kick Acoustic.wav')).toBe(false);
+  });
+  it('OR and | give alternatives', () => {
+    expect(m('kick OR snare', 'Snare Tight.wav')).toBe(true);
+    expect(m('kick | snare', 'Kick.wav')).toBe(true);
+    expect(m('kick OR snare', 'Hat.wav')).toBe(false);
+  });
+  it('-word excludes', () => {
+    expect(m('kick -out', 'Kick In.wav')).toBe(true);
+    expect(m('kick -out', 'Kick Out.wav')).toBe(false);
+    expect(m('-loop', 'one shot.wav')).toBe(true);
+  });
+  it('quotes keep a phrase together', () => {
+    expect(m('"drum loop"', 'Big Drum Loop 120.wav')).toBe(true);
+    expect(m('"drum loop"', 'Drum fill loop.wav')).toBe(false);
+  });
+  it('an empty search matches everything', () => expect(m('  ', 'x.wav')).toBe(true));
+});
+
+describe('ignored folders', () => {
+  const words = L.ignoreWords('old, _bak  presets');
+  it('checks folder names, not the file name', () => {
+    expect(L.inIgnoredFolder('Drums/Old Kits/kick.wav', words)).toBe(true);
+    expect(L.inIgnoredFolder('Drums/kick old school.wav', words)).toBe(false);
+    expect(L.inIgnoredFolder('kick.wav', words)).toBe(false);
+  });
+});
+
+describe('sorting', () => {
+  const e = (name) => ({ name, path: `/s/${name}`, isDirectory: false });
+  const files = [e('a.wav'), e('b.aif'), e('c.wav')];
+  const dir = { name: 'Folder', path: '/s/Folder', isDirectory: true };
+  const stats = { '/s/b.aif': { stars: 4 }, '/s/c.wav': { stars: 2, adds: 2 }, '/s/a.wav': { plays: 5 } };
+  it('keeps folders first and sorts files', () => {
+    expect(L.sortEntries([...files, dir], 'rating', stats).map((x) => x.name)).toEqual(['Folder', 'b.aif', 'c.wav', 'a.wav']);
+    expect(L.sortEntries(files, 'used', stats).map((x) => x.name)).toEqual(['c.wav', 'a.wav', 'b.aif']); // 2 adds = 6 > 5 plays
+    expect(L.sortEntries(files, 'type', stats).map((x) => x.name)).toEqual(['b.aif', 'a.wav', 'c.wav']);
+    expect(L.sortEntries(files, 'name', stats)).toEqual(files);
+  });
+});
+
 async function connected() {
   const engine = new Luna.MockEngine();
   engine.addSession('abc', { name: 'Demo', tracks: ['Drums'] });

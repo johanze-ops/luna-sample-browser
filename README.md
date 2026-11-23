@@ -22,13 +22,30 @@ opens in the right-hand browser panel.
 - **Audition:** click a loop. If the session is playing, the loop comes in at the next bar.
   If it's stopped, the session starts playing from the playhead's bar. With LUNA's loop on,
   the preview fills the loop range, so it plays every time round.
-- **Keys:** use ↑ and ↓ to step through the loops (they play as you go, unless you untick
-  *Play on select*), → to open a folder, ← to go back up, **Enter** to add the loop to the
-  session and **Esc** to stop.
-- **Add to session:** puts the loop on a new track named after the file. It fills the loop
-  range when LUNA is looping, and otherwise adds one pass from the bar the preview started
-  on. The new track gets the same warp mode as the Sample Preview track.
-- **Volume:** the slider is the Sample Preview track's fader.
+- **Search:** type in the search box. It searches the folder you're in and every folder
+  inside it, or switch to *Chosen folders* and tick which of your added folders to search
+  (it only ever looks in folders you've added). Spaces need every word (`kick 808`), `OR` or `|` gives either
+  (`kick OR snare`), `-word` leaves it out (`kick -out`), and "quotes" keep a phrase together.
+  Folder names count too, so `drums -raw` skips a folder called RAW.
+- **One-shots** (short files with no BPM in the name, like a kick or snare hit) play on
+  every bar while you audition them, so they sit in time with the session. Change it to
+  every beat, or once, in Settings.
+- **Rate and colour:** press **1–5** to star a sample (**0** clears) and **C** to cycle its
+  colour, or click the stars and the dot. The browser also counts how often you audition
+  and add each sample.
+- **Sort and filter:** sort by name, rating, most used or file type, and show only loops or
+  one-shots, a minimum rating or a colour. Ratings, colours and counts are kept across all
+  your sessions.
+- **Add:** **New track** (Enter) puts the sample on a new track named after the file;
+  **To track** (Shift+Enter) puts it on the track you have selected in LUNA. A loop fills
+  the loop range when LUNA is looping, and otherwise one pass is added from the bar the
+  preview started on. A new track gets the same warp mode as the Sample Preview track.
+- **Keys:** ↑ and ↓ step through samples (they play as you go, unless you untick *Play on
+  select* in Settings), → opens a folder, ← goes back up, **Esc** stops, **/** jumps to the
+  search and **?** shows every shortcut.
+- **Settings:** the tempo range for detected tempos, the preview volume (the Sample Preview
+  track's fader), *Play on select*, and **Ignore folders**: words that hide any folder whose
+  name contains them (for example `old, _bak, presets`).
 
 ## Tempo
 

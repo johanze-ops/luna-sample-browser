@@ -152,9 +152,99 @@ const AddOnLogic = {
     return at;
   },
 
+  /**
+   * A one-shot struck at every `interval` from `anchor`, inside `ranges`, unwarped: each hit
+   * is `hitTicks` long (the file at the session tempo), cut short by the next hit or the end
+   * of its range. A hit whose start falls outside every range is left out.
+   */
+  hitPieces(anchor, interval, ranges, hitTicks, sourceNs) {
+    const pieces = [];
+    if (!(interval > 0) || !(hitTicks > 0)) return pieces;
+    for (const [a, b] of ranges) {
+      if (!(b > a)) continue;
+      for (let k = Math.ceil((a - anchor) / interval), s = anchor + k * interval; s < b && pieces.length < 512; k++, s = anchor + k * interval) {
+        const len = Math.min(hitTicks, interval, b - s);
+        pieces.push({ startTick: s, stopTick: s + len, sourceStartNs: 0, sourceStopNs: Math.round((sourceNs * len) / hitTicks) });
+      }
+    }
+    return pieces;
+  },
+
+  /** The start of the beat `tick` is in. */
+  beatStartTick(timeline, tick) {
+    const b = timeline.barBeat(tick);
+    return timeline.tickAt({ bar: b.bar, beat: b.beat });
+  },
+
   /** The downbeat of the bar `tick` is in. */
   barStartTick(timeline, tick) {
     return timeline.tickAt({ bar: timeline.barBeat(tick).bar });
+  },
+
+  /**
+   * Parse a search: spaces mean AND, `OR` or `|` between terms gives alternatives, `-word`
+   * excludes, and "quoted words" match as one phrase. Case is ignored.
+   *   kick 808          -> files with both
+   *   kick OR snare     -> files with either
+   *   kick -out         -> kicks without "out"
+   * Returns { alts: [[term, ...], ...], none: [term, ...] }.
+   */
+  parseQuery(q) {
+    const tokens = String(q ?? '').toLowerCase().match(/-?"[^"]*"|\S+/g) ?? [];
+    const alts = [[]];
+    const none = [];
+    for (let tok of tokens) {
+      if (tok === 'or' || tok === '|') { if (alts.at(-1).length) alts.push([]); continue; }
+      const neg = tok.startsWith('-') && tok.length > 1;
+      if (neg) tok = tok.slice(1);
+      tok = tok.replace(/^"|"$/g, '');
+      if (!tok) continue;
+      (neg ? none : alts.at(-1)).push(tok);
+    }
+    return { alts: alts.filter((a) => a.length), none };
+  },
+
+  /** Does `text` match a parsed query? An empty query matches everything. */
+  matches(text, query) {
+    const t = String(text ?? '').toLowerCase();
+    if (query.none.some((w) => t.includes(w))) return false;
+    if (!query.alts.length) return true;
+    return query.alts.some((all) => all.every((w) => t.includes(w)));
+  },
+
+  /** Words from the "ignore folders" setting: comma or space separated. */
+  ignoreWords(setting) {
+    return String(setting ?? '').toLowerCase().split(/[,\s]+/).map((w) => w.trim()).filter(Boolean);
+  },
+
+  /** True when any folder in `relativePath` (not the file name) contains an ignored word. */
+  inIgnoredFolder(relativePath, words) {
+    if (!words.length) return false;
+    const folders = String(relativePath ?? '').toLowerCase().split('/').slice(0, -1);
+    return folders.some((f) => words.some((w) => f.includes(w)));
+  },
+
+  /** How much a file has been used: adding it counts more than auditioning it. */
+  usage(stat) {
+    return stat ? (stat.adds ?? 0) * 3 + (stat.plays ?? 0) : 0;
+  },
+
+  /**
+   * Sort entries (folders always first, in their own order). `by`: 'name' keeps LUNA's natural
+   * order, 'rating' best first, 'used' most used first, 'type' by file type then name.
+   */
+  sortEntries(entries, by, stats = {}) {
+    const dirs = entries.filter((e) => e.isDirectory);
+    const files = entries.filter((e) => !e.isDirectory);
+    const idx = new Map(files.map((e, i) => [e, i]));
+    const ext = (e) => (/\.([^.]+)$/.exec(e.name)?.[1] ?? '').toLowerCase();
+    const keyed = {
+      rating: (a, b) => (stats[b.path]?.stars ?? 0) - (stats[a.path]?.stars ?? 0),
+      used: (a, b) => AddOnLogic.usage(stats[b.path]) - AddOnLogic.usage(stats[a.path]),
+      type: (a, b) => ext(a).localeCompare(ext(b)),
+    }[by];
+    const sorted = keyed ? [...files].sort((a, b) => keyed(a, b) || idx.get(a) - idx.get(b)) : files;
+    return [...dirs, ...sorted];
   },
 
   /** LUNA's own tempo analysis of a file (undocumented engine command; null if unavailable). */
@@ -185,11 +275,34 @@ class Previewer {
     this.busy = Promise.resolve();
   }
 
-  /** Run engine work one job at a time, so a quick run of clicks cannot interleave. */
-  queue(fn) {
-    const run = this.busy.then(fn, fn);
+  /**
+   * Run engine work one job at a time, so a quick run of clicks cannot interleave. A job that
+   * has not finished in 15 s (a request LUNA never answered, a session that went away) is
+   * given up on, so it can never block every audition after it.
+   */
+  queue(fn, timeoutMs = 15000) {
+    const guarded = () => Promise.race([
+      Promise.resolve().then(fn),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('LUNA did not answer in time')), timeoutMs)),
+    ]);
+    const run = this.busy.then(guarded, guarded);
     this.busy = run.catch(() => undefined);
     return run;
+  }
+
+  /**
+   * Every clip on the Sample Preview track, whoever put it there. The track is the browser's
+   * own, so anything on it is a preview: one this page placed, or one saved in the session
+   * before LUNA was closed or the page reloaded.
+   */
+  async clipsOnTrack(track) {
+    try {
+      const n = await this.luna.raw.get(track.path, { children: false, commands: false, propfilter: 'playlist_uid', flatvalue: true });
+      const pl = n?.properties?.playlist_uid;
+      if (!pl) return [];
+      const c = await this.luna.raw.get(`${this.session.path}/playlists/${pl}/clips`, { levels: 1, properties: false, commands: false });
+      return (c?.children ?? []).map((k) => k.path).filter(Boolean);
+    } catch { return []; }
   }
 
   findTrack() {
@@ -305,41 +418,55 @@ class Previewer {
       const here = t.tick;
       const barTicks = tl.tickAt({ bar: 2 }) - tl.tickAt({ bar: 1 });
 
-      let pieces, lengthTicks = null, startTick, lengthFollows, loop = null, gap = null;
-      if (plan.kind === 'loop') {
+      // A loop repeats itself, warped; a one-shot repeats unwarped on every bar or beat
+      // (oneShotRepeat), so a kick plays in time instead of once at a random moment.
+      const repeat = plan.kind === 'oneshot' ? this.oneShotRepeat : null;
+      let kind = plan.kind === 'loop' ? 'loop' : repeat && repeat !== 'once' ? 'repeat' : 'once';
+      let pieces, lengthTicks = null, hitTicks = null, startTick, loop = null, gap = null;
+      const lengthFollows = kind === 'loop' ? 'ticks' : 'time';
+      if (kind === 'once') {
+        startTick = playing ? AddOnLogic.nextBeatTick(tl, here) : (t.playStart.value ?? here);
+        pieces = [{ startTick, stopTick: tl.tickAtSeconds(tl.seconds(startTick) + seconds), sourceStartNs: 0, sourceStopNs: srcNs }];
+      } else {
         const from = playing ? here : (t.playStart.value ?? here);
-        startTick = playing ? AddOnLogic.nextBarTick(tl, here) : AddOnLogic.barStartTick(tl, from);
-        lengthTicks = AddOnLogic.loopTicks(seconds, plan.bpm, plan.bars);
-        lengthFollows = 'ticks';
+        const onBeat = kind === 'repeat' && repeat === 'beat';
+        startTick = onBeat
+          ? (playing ? AddOnLogic.nextBeatTick(tl, here) : AddOnLogic.beatStartTick(tl, from))
+          : (playing ? AddOnLogic.nextBarTick(tl, here) : AddOnLogic.barStartTick(tl, from));
+        if (kind === 'loop') lengthTicks = AddOnLogic.loopTicks(seconds, plan.bpm, plan.bars);
+        else {
+          lengthTicks = onBeat ? Luna.TICKS_PER_BEAT : barTicks;
+          hitTicks = tl.tickAtSeconds(tl.seconds(startTick) + seconds) - startTick;
+        }
+        const cutFor = (anchor, ranges) => (kind === 'loop'
+          ? AddOnLogic.tilePieces(anchor, lengthTicks, ranges, srcNs)
+          : AddOnLogic.hitPieces(anchor, lengthTicks, ranges, hitTicks, srcNs));
         loop = this.loopRange(from);
         if (loop) {
           // LUNA is looping: fill the whole loop range, in phase with its start, so the preview
-          // plays every time round. While playing, the bar you clicked in waits until the
-          // playhead has passed it, so the sample still comes in at the next bar.
+          // plays every time round. While playing, the bar (or beat) you clicked in waits until
+          // the playhead has passed it, so the sample still comes in at the next one.
           const [a, b] = loop;
           startTick = Math.min(startTick, b);
-          gap = playing ? [Math.max(a, AddOnLogic.barStartTick(tl, here)), startTick] : null;
-          const ranges = gap ? [[a, gap[0]], [gap[1], b]] : [[a, b]];
-          pieces = AddOnLogic.tilePieces(a, lengthTicks, ranges, srcNs);
+          const cellStart = onBeat ? AddOnLogic.beatStartTick(tl, here) : AddOnLogic.barStartTick(tl, here);
+          gap = playing ? [Math.max(a, cellStart), startTick] : null;
+          pieces = cutFor(a, gap ? [[a, gap[0]], [gap[1], b]] : [[a, b]]);
           if (gap && !(gap[1] > gap[0])) gap = null;
         } else {
-          pieces = this.passes(startTick, lengthTicks, Math.max(2, Math.ceil((this.aheadBars * barTicks) / lengthTicks)), srcNs);
+          const span = Math.max(2 * lengthTicks, Math.ceil((this.aheadBars * barTicks) / lengthTicks) * lengthTicks);
+          pieces = cutFor(startTick, [[startTick, startTick + span]]);
         }
-      } else {
-        startTick = playing ? AddOnLogic.nextBeatTick(tl, here) : (t.playStart.value ?? here);
-        pieces = [{ startTick, stopTick: tl.tickAtSeconds(tl.seconds(startTick) + seconds), sourceStartNs: 0, sourceStopNs: srcNs }];
-        lengthFollows = 'time';
       }
 
-      const old = this.clipUids;
+      const old = [...new Set([...this.clipUids, ...(await this.clipsOnTrack(track))])];
       this.clipUids = [];
       this.firstClip = null;
       await this.session.transaction('Preview', async () => {
         await this.deleteClips(old);
         this.clipUids = await this.insertPieces(track, src.id, pieces, lengthFollows);
       });
-      const coveredUntil = loop ? loop[1] : Math.max(...pieces.map((p) => p.stopTick));
-      this.current = { path: file.path, name: file.name, sourceUid: src.id, plan, seconds, srcNs, startTick, lengthTicks, coveredUntil, kind: plan.kind, loop, gap };
+      const coveredUntil = loop ? loop[1] : (kind === 'once' ? pieces[0].stopTick : startTick + Math.ceil((Math.max(...pieces.map((p) => p.stopTick)) - startTick) / lengthTicks) * lengthTicks);
+      this.current = { path: file.path, name: file.name, sourceUid: src.id, plan, seconds, srcNs, startTick, lengthTicks, hitTicks, coveredUntil, kind, loop, gap };
       if (!playing) {
         if (plan.kind === 'loop') await this.waitForRender();
         await t.play();
@@ -353,9 +480,17 @@ class Previewer {
    * Keep a loop going as the playhead moves: fill the bar that was skipped once the playhead is
    * past it (looping), or add another stretch of copies when the playhead nears the end.
    */
+  /** The pieces of the current preview that fall in `ranges`, in phase with `anchor`. */
+  cut(cur, anchor, ranges) {
+    return cur.kind === 'loop'
+      ? AddOnLogic.tilePieces(anchor, cur.lengthTicks, ranges, cur.srcNs)
+      : AddOnLogic.hitPieces(anchor, cur.lengthTicks, ranges, cur.hitTicks, cur.srcNs);
+  }
+
   extend() {
     const cur = this.current;
-    if (!cur || cur.kind !== 'loop' || this.extending) return Promise.resolve();
+    if (!cur || cur.kind === 'once' || this.extending) return Promise.resolve();
+    const follows = cur.kind === 'loop' ? 'ticks' : 'time';
     const t = this.session.transport;
     const tick = t.tick;
     if (cur.gap && (tick >= cur.gap[1] || tick < cur.gap[0])) {
@@ -365,9 +500,9 @@ class Previewer {
       return this.queue(async () => {
         if (this.current !== cur) return;
         const track = await this.track();
-        const pieces = AddOnLogic.tilePieces(cur.loop[0], cur.lengthTicks, [gap], cur.srcNs);
+        const pieces = this.cut(cur, cur.loop[0], [gap]);
         await this.session.transaction('Preview', async () => {
-          this.clipUids.push(...(await this.insertPieces(track, cur.sourceUid, pieces, 'ticks')));
+          this.clipUids.push(...(await this.insertPieces(track, cur.sourceUid, pieces, follows)));
         });
       }).finally(() => { this.extending = false; });
     }
@@ -379,18 +514,20 @@ class Previewer {
     return this.queue(async () => {
       if (this.current !== cur) return;
       const track = await this.track();
-      const pieces = this.passes(cur.coveredUntil, cur.lengthTicks, Math.max(1, Math.ceil((this.aheadBars * barTicks) / cur.lengthTicks)), cur.srcNs);
+      const until = cur.coveredUntil + Math.max(1, Math.ceil((this.aheadBars * barTicks) / cur.lengthTicks)) * cur.lengthTicks;
+      const pieces = this.cut(cur, cur.coveredUntil, [[cur.coveredUntil, until]]);
       await this.session.transaction('Preview', async () => {
-        this.clipUids.push(...(await this.insertPieces(track, cur.sourceUid, pieces, 'ticks')));
+        this.clipUids.push(...(await this.insertPieces(track, cur.sourceUid, pieces, follows)));
       });
-      cur.coveredUntil = pieces.at(-1).stopTick;
+      cur.coveredUntil = until;
     }).finally(() => { this.extending = false; });
   }
 
   /** Stop auditioning: remove the preview clips, and stop the transport if we started it. */
   stop({ stopTransport = true } = {}) {
     return this.queue(async () => {
-      const uids = this.clipUids;
+      const track = this.findTrack();
+      const uids = [...new Set([...this.clipUids, ...(track ? await this.clipsOnTrack(track) : [])])];
       this.clipUids = [];
       this.current = null;
       if (uids.length) await this.session.transaction('Preview', () => this.deleteClips(uids));
@@ -406,6 +543,16 @@ class Previewer {
    * Returns { track, clips }.
    */
   addToSession() {
+    return this.add(null);
+  }
+
+  /** The same as addToSession, onto an existing track (not the Sample Preview track). */
+  addToTrack(track) {
+    if (!track || track.name.value === PREVIEW_TRACK_NAME) return Promise.reject(new Error('pick a track other than Sample Preview'));
+    return this.add(track);
+  }
+
+  add(target) {
     return this.queue(async () => {
       const cur = this.current;
       if (!cur) return null;
@@ -413,7 +560,7 @@ class Previewer {
       const name = cur.name.replace(/\.[^.]+$/, '');
       const alg = await this.trackAlg(await this.track());
       const algName = ALG_TYPES[alg];
-      const track = await this.newTrackLike(name, algName);
+      const track = target ?? (await this.newTrackLike(name, algName));
       let pieces;
       const loop = cur.kind === 'loop' ? (this.loopRange(cur.startTick) ?? (cur.loop && this.session.transport.looping.value ? cur.loop : null)) : null;
       if (loop) pieces = AddOnLogic.tilePieces(loop[0], cur.lengthTicks, [loop], cur.srcNs);
