@@ -1,5 +1,7 @@
 # Sample Browser for LUNA
 
+![Sample Browser](images/banner.png)
+
 Browse your sample folders inside LUNA and audition loops **in time with your session**,
 the way Ableton's browser does. LUNA's own engine does the work: the loop is warped to your
 session tempo and plays through LUNA's mixer on a track called **Sample Preview**, so you
