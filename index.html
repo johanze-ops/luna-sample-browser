@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Sample Browser</title>
+  <style>
+    :root { color-scheme: dark; --accent: #F7C449; --bg: #161616; --panel: #1f1f1f; --line: #2c2c2c; --text: #ddd; --dim: #8a8a8a; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 13px -apple-system, Helvetica, sans-serif; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+    button, select, input { font: inherit; color: var(--text); background: #2a2a2a; border: 1px solid #3d3d3d; border-radius: 5px; }
+    button { padding: 4px 9px; cursor: pointer; }
+    button:hover { border-color: #5a5a5a; }
+    button.primary { background: var(--accent); color: #111; border-color: var(--accent); }
+    .bar { display: flex; align-items: center; gap: 6px; padding: 7px 10px; background: var(--panel); border-bottom: 1px solid var(--line); }
+    #folders { flex: 1; min-width: 0; padding: 4px 6px; }
+    #crumbs { flex: 1; min-width: 0; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; }
+    #filter { flex: 1; min-width: 0; padding: 4px 7px; }
+    .settings { gap: 10px; color: var(--dim); font-size: 12px; flex-wrap: wrap; }
+    .settings input[type=number] { width: 46px; padding: 2px 4px; }
+    .settings input[type=range] { width: 90px; }
+    .settings label { display: flex; align-items: center; gap: 5px; }
+    main { flex: 1; overflow: auto; outline: none; }
+    .row { display: flex; align-items: center; gap: 8px; padding: 5px 10px; border-bottom: 1px solid #202020; cursor: pointer; user-select: none; }
+    .row:hover { background: #1c1c1c; }
+    .row.sel { background: #2a2618; }
+    .row.playing .name::before { content: '▶ '; color: var(--accent); }
+    .row .icon { width: 14px; color: var(--dim); text-align: center; }
+    .row .name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .row .bpm { font: 12px Menlo, monospace; color: var(--dim); min-width: 74px; text-align: right; }
+    .row .bpm b { color: var(--text); font-weight: 500; }
+    .row .tools { display: none; gap: 4px; }
+    .row.sel .tools { display: flex; }
+    .row .tools button { padding: 1px 6px; font-size: 11px; }
+    .empty { padding: 24px 14px; color: var(--dim); line-height: 1.5; }
+    footer { display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: var(--panel); border-top: 1px solid var(--line); color: var(--dim); font-size: 12px; }
+    #status { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    main.drop { outline: 2px dashed var(--accent); outline-offset: -4px; }
+  </style>
+</head>
+<body>
+  <div class="bar">
+    <select id="folders" title="Sample folders LUNA lets Add Ons read"></select>
+    <button id="addFolder" title="Add a sample folder">+ Folder</button>
+  </div>
+  <div class="bar">
+    <button id="up" title="Up one folder (Left arrow)">↑</button>
+    <div id="crumbs"></div>
+  </div>
+  <div class="bar">
+    <input id="filter" type="search" placeholder="Filter this folder">
+  </div>
+  <div class="bar settings">
+    <label title="Tempos LUNA detects are doubled or halved into this range">Tempo range <input id="lo" type="number" min="40" max="240"> – <input id="hi" type="number" min="41" max="300"></label>
+    <label title="The Sample Preview track's fader">Volume <input id="vol" type="range" min="0" max="1000"></label>
+    <label><input id="autoplay" type="checkbox"> Play on select</label>
+  </div>
+  <main id="list" tabindex="0"></main>
+  <footer>
+    <div id="status">connecting...</div>
+    <button id="stop" title="Stop the preview (Esc)">Stop</button>
+    <button id="add" class="primary" title="Add the sample to a new track (Enter)">Add to session</button>
+  </footer>
+  <script src="vendor/luna.global.js"></script>
+  <script src="logic.js"></script>
+  <script src="main.js"></script>
+</body>
+</html>
