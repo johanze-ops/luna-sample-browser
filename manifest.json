@@ -6,6 +6,7 @@
     "manufacturer": "JOHANZE",
     "description": "Browse sample folders and audition loops in time with the session, warped by LUNA, then drop them onto a track.",
     "categories": ["Import & Export"],
+    "icon": "images/icon.png",
     "sdk_version": "3.1.2",
     "min_luna_version": "3.1.2",
     "engines": ["luna"],

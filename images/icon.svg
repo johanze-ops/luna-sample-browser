@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 512 512">
+  <!-- Sample Browser icon (JOHANZE), in the style of UA's Add On icons: dark panel, one flat glyph.
+       A loop's waveform inside teal sync arrows: audition samples in time with the session.
+       Render: Chrome headless at 1024 x 1024 (see scripts in ableton-to-luna/images/render.sh). -->
+  <defs><linearGradient id="panel" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2C2D30"/><stop offset="1" stop-color="#17181A"/></linearGradient>
+    <linearGradient id="teal" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#5DDCD0"/><stop offset="1" stop-color="#2BAFA4"/></linearGradient>
+  </defs>
+  <rect x="0" y="0" width="512" height="512" fill="#0D0E0F"/><rect x="4" y="4" width="504" height="504" fill="url(#panel)"/><rect x="4" y="4" width="504" height="4" fill="#ffffff" opacity="0.08"/>
+  <!-- sync arrows: two arcs around the centre with arrowheads -->
+  <g fill="none" stroke="url(#teal)" stroke-width="30" stroke-linecap="round">
+    <path d="M118 236 A140 140 0 0 1 356 150"/>
+    <path d="M394 276 A140 140 0 0 1 156 362"/>
+  </g>
+  <path d="M332 106 L404 150 L330 190 Z" fill="#5DDCD0"/>
+  <path d="M180 406 L108 362 L182 322 Z" fill="#2BAFA4"/>
+  <!-- the loop's waveform -->
+  <g fill="#E8E9EB">
+    <rect x="164" y="232" width="18" height="48" rx="9"/>
+    <rect x="196" y="200" width="18" height="112" rx="9"/>
+    <rect x="228" y="176" width="18" height="160" rx="9"/>
+    <rect x="260" y="214" width="18" height="84" rx="9"/>
+    <rect x="292" y="188" width="18" height="136" rx="9"/>
+    <rect x="324" y="224" width="18" height="64" rx="9"/>
+  </g>
+</svg>
