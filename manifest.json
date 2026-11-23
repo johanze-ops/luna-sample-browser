@@ -2,7 +2,7 @@
     "package_name": "Sample Browser",
     "id": "com.ranrun.sample_browser",
     "title": "Sample Browser",
-    "version": "0.2.0",
+    "version": "0.2.1",
     "manufacturer": "JOHANZE",
     "description": "Browse sample folders and audition loops in time with the session, warped by LUNA, then drop them onto a track.",
     "categories": ["Import & Export"],
