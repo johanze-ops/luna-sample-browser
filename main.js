@@ -364,6 +364,10 @@ async function addSample({ toSelected = false } = {}) {
       added = await previewer.addToSession();
     }
     if (!added) return;
+    // The sample now plays from its own track: take the preview away so it doesn't double up,
+    // but keep the session playing so you hear it in place.
+    await previewer.stop({ stopTransport: false });
+    for (const x of shown) if (x.path === cur.path) paintRow(x);
     const s = stat(cur.path);
     s.adds = (s.adds ?? 0) + 1;
     prefs.save();

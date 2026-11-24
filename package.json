@@ -1,7 +1,7 @@
 {
   "name": "sample_browser",
   "private": true,
-  "version": "0.2.2",
+  "version": "0.2.3",
   "type": "module",
   "description": "Sample Browser, a LUNA Add On built with @uaudio/luna-builder-sdk",
   "scripts": {
