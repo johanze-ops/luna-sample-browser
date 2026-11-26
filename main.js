@@ -17,6 +17,7 @@ const prefs = (() => {
   data.ignore ??= ''; data.sort ??= 'name'; data.scope ??= 'below';
   if (data.scope === 'here') data.scope = 'below'; // searching always includes subfolders now
   data.oneshot ??= 'bar';
+  data.loopStart ??= 'beat'; // while playing, a loop comes in on the next beat or bar
   data.skip ??= {}; // added folders left out of "Chosen folders" searches
   let timer = null;
   return {
@@ -213,6 +214,7 @@ function draw(keepPath = null) {
   shown = L.sortEntries(entries.filter(pass), $('sort').value, P.stats);
   sel = keepPath ? shown.findIndex((e) => e.path === keepPath) : (shown[sel]?.path ? sel : -1);
   renderList();
+  showWave(shown[sel]);
   detectInBackground();
 }
 
@@ -288,7 +290,93 @@ function select(i, { play = false } = {}) {
   if (shown[old]) paintRow(shown[old]);
   paintRow(shown[i]);
   $('list').querySelector(`.row[data-i="${i}"]`)?.scrollIntoView({ block: 'nearest' });
+  showWave(shown[i]);
   if (play && !shown[i].isDirectory) audition(shown[i]);
+}
+
+// ---------- the selected sample's waveform ----------
+// Drawn from the file itself: LUNA serves the files in the added folders to the page
+// (luna.gui.serveMediaFile), so nothing is brought into the session. Only the selected sample,
+// one at a time; the outlines of the last few are kept. Very big files are skipped.
+const WAVE_COLUMNS = 1024, WAVE_MAX_BYTES = 40 * 1024 * 1024, WAVE_KEEP = 40;
+const waves = new Map(); // path -> { min, max }, most recently shown last
+let waveFor = null, waveCtx = null, addOnId = null;
+
+async function mediaUrl(path) {
+  addOnId ??= (await luna.gui.thisInstance().catch(() => undefined))?.addOnId ?? 'com.ranrun.sample_browser';
+  return luna.gui.serveMediaFile(addOnId, path);
+}
+
+/** The file's bytes, or a rejection when it is over WAVE_MAX_BYTES or can't be read. */
+function readBytes(url) {
+  return new Promise((resolve, reject) => {
+    const x = new XMLHttpRequest(); // not fetch(): it refuses LUNA's file URLs on Windows
+    x.open('GET', url);
+    x.responseType = 'arraybuffer';
+    x.onreadystatechange = () => {
+      if (x.readyState === 2 && Number(x.getResponseHeader('Content-Length')) > WAVE_MAX_BYTES) x.abort();
+    };
+    x.onload = () => (x.status === 200 || x.status === 0 ? resolve(x.response) : reject(new Error(`HTTP ${x.status}`)));
+    x.onerror = () => reject(new Error('unreadable'));
+    x.onabort = () => reject(new Error('too big to draw'));
+    x.send();
+  });
+}
+
+async function showWave(e) {
+  const box = $('wave');
+  const path = e && !e.isDirectory ? e.path : null;
+  if (path === waveFor && path) return;
+  waveFor = path;
+  if (!path || !luna?.gui) { box.hidden = true; return; }
+  box.hidden = false;
+  let peaks = waves.get(path);
+  if (peaks) waves.delete(path); // to the end: most recently shown
+  else {
+    drawWave(null);
+    try {
+      const bytes = await readBytes(await mediaUrl(path));
+      if (waveFor !== path) return;
+      waveCtx ??= new AudioContext();
+      const audio = await waveCtx.decodeAudioData(bytes);
+      peaks = L.wavePeaks(Array.from({ length: audio.numberOfChannels }, (_, c) => audio.getChannelData(c)), WAVE_COLUMNS);
+    } catch {
+      if (waveFor === path) box.hidden = true; // not a file the page can read or decode
+      return;
+    }
+  }
+  waves.set(path, peaks);
+  if (waves.size > WAVE_KEEP) waves.delete(waves.keys().next().value);
+  if (waveFor === path) drawWave(peaks);
+}
+
+/** Draw `peaks` across the strip as LUNA draws a clip: one filled shape around the zero line. */
+function drawWave(peaks) {
+  const cv = $('wave').querySelector('canvas');
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.round(cv.clientWidth * dpr)), h = Math.max(1, Math.round(cv.clientHeight * dpr));
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  const g = cv.getContext('2d');
+  g.clearRect(0, 0, w, h);
+  const mid = h / 2;
+  if (!peaks) { g.fillStyle = 'rgba(138,138,138,.35)'; g.fillRect(0, Math.floor(mid), w, 1); return; }
+  const n = peaks.min.length, top = [], bottom = [];
+  for (let x = 0; x < w; x++) {
+    const from = Math.floor((x * n) / w), to = Math.max(from + 1, Math.floor(((x + 1) * n) / w));
+    let lo = 0, hi = 0;
+    for (let c = from; c < to && c < n; c++) { lo = Math.min(lo, peaks.min[c]); hi = Math.max(hi, peaks.max[c]); }
+    top.push(Math.min(mid - 0.5, mid - hi * mid));
+    bottom.push(Math.max(mid + 0.5, mid - lo * mid));
+  }
+  g.beginPath();
+  g.moveTo(0, top[0]);
+  for (let x = 1; x < w; x++) g.lineTo(x, top[x]);
+  for (let x = w - 1; x >= 0; x--) g.lineTo(x, bottom[x]);
+  g.closePath();
+  g.globalAlpha = 0.85;
+  g.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#F7C449';
+  g.fill();
+  g.globalAlpha = 1;
 }
 
 // ---------- ratings ----------
@@ -439,17 +527,20 @@ async function clipPaths(track) {
  * It is taken before the drag begins and writes nothing: LUNA can be slow to answer while a
  * drag is on, and a snapshot that finished after the drop would hide it (seen 2026-11-26).
  * The undo position is read first; if it moved while the clips were listed, the clip list
- * may already hold something new, so it is marked as not sure.
+ * may already hold something new, so it is marked as not sure. LUNA's loop range is noted
+ * too: LUNA selects the clip it drops, which moves the loop range onto that clip.
  */
 async function dropSnapshot() {
   const tracks = new Set(session.tracks.items.map((t) => t.id));
+  const tp = session.transport;
+  const loop = tp.looping.value === true && tp.loopStop.value > tp.loopStart.value ? [tp.loopStart.value, tp.loopStop.value] : null;
   const [entries, uid] = await Promise.all([undoEntries(), undoUid()]);
   const clips = new Map();
   await L.mapLimit(session.tracks.items, 8, async (t) => clips.set(t.id, new Set(await clipPaths(t))));
   const clipsSure = (await undoUid()) === uid;
   const sources = session.sources ?? (await session.loadSources().catch(() => null));
   const lastRow = entries.at(-1)?.rowid ?? -1;
-  return { lastRow, undoUid: uid, tracks, clips, clipsSure, sources: sources ? new Set(sources.items.map((x) => x.id)) : null };
+  return { lastRow, undoUid: uid, tracks, clips, clipsSure, loop, sources: sources ? new Set(sources.items.map((x) => x.id)) : null };
 }
 
 /**
@@ -529,14 +620,20 @@ async function settleDrop(file, snapPromise, effect) {
     for (let i = 0; i < 20 && (await undoUid()) !== keep; i++) await pause(50);
     if ((await undoUid()) !== keep) return status(`Undoing LUNA's drop of ${file.name} didn't go as expected: check the undo list.`);
     const target = found.isNew || found.track.name.value === L.PREVIEW_TRACK_NAME ? null : found.track;
-    const placed = await previewer.placeAt(file, await tempoFor(file), { track: target, startTick: found.start, loopsOnBar: true, stopPreview: true });
+    const placed = await previewer.placeAt(file, await tempoFor(file), { track: target, startTick: found.start, loopsOnBar: true, stopPreview: true, loopRange: snap.loop });
     swapped = true;
+    // LUNA moved the loop range onto the clip it dropped: put back the one set before the drag.
+    const t = session.transport;
+    if (snap.loop && (t.loopStart.value !== snap.loop[0] || t.loopStop.value !== snap.loop[1])) await t.setLoop(snap.loop[0], snap.loop[1]).catch(() => undefined);
     const st = stat(file.path);
     st.adds = (st.adds ?? 0) + 1;
     st.kind = placed.plan.kind;
     prefs.save();
-    const bar = session.musical.timeline.barBeat(placed.startTick).bar;
-    status(`Added ${file.name} to “${placed.track.name.value ?? ''}” at bar ${bar}${placed.plan.kind === 'loop' ? ` · ${placed.plan.bpm.toFixed(1)} BPM` : ' · one-shot'}`);
+    const tl = session.musical.timeline;
+    const where = placed.filledLoop
+      ? `filling the loop range, bar ${tl.barBeat(placed.filledLoop[0]).bar} to bar ${tl.barBeat(placed.filledLoop[1]).bar}`
+      : `at bar ${tl.barBeat(placed.startTick).bar}`;
+    status(`Added ${file.name} to “${placed.track.name.value ?? ''}” ${where}${placed.plan.kind === 'loop' ? ` · ${placed.plan.bpm.toFixed(1)} BPM` : ' · one-shot'}`);
   } catch (err) {
     status(`Couldn't finish the drop of ${file.name}: ${err.code ?? err.message}`);
   } finally {
@@ -572,8 +669,9 @@ async function bindVolume() {
 // ---------- events ----------
 function wireUi() {
   $('lo').value = P.lo; $('hi').value = P.hi; $('autoplay').checked = !!P.autoplay; $('ignore').value = P.ignore;
-  $('sort').value = P.sort; $('scope').value = P.scope; $('oneshot').value = P.oneshot;
+  $('sort').value = P.sort; $('scope').value = P.scope; $('oneshot').value = P.oneshot; $('loopstart').value = P.loopStart;
   $('oneshot').onchange = () => { P.oneshot = $('oneshot').value; prefs.save(); if (previewer) previewer.oneShotRepeat = P.oneshot; };
+  $('loopstart').onchange = () => { P.loopStart = $('loopstart').value; prefs.save(); if (previewer) previewer.loopStart = P.loopStart; };
   $('lo').onchange = () => { P.lo = Number($('lo').value) || 75; prefs.save(); draw(); };
   $('hi').onchange = () => { P.hi = Number($('hi').value) || 150; prefs.save(); draw(); };
   $('autoplay').onchange = () => { P.autoplay = $('autoplay').checked; prefs.save(); };
@@ -593,6 +691,7 @@ function wireUi() {
   // LUNA only reloads an Add On page when it restarts: double-click the status line instead.
   $('status').ondblclick = () => location.reload();
   $('help').onclick = () => $('help').classList.remove('on');
+  new ResizeObserver(() => { if (waves.has(waveFor)) drawWave(waves.get(waveFor)); }).observe($('wave'));
 
   $('list').onclick = (ev) => {
     const row = ev.target.closest('.row');
@@ -695,6 +794,7 @@ async function bindSession() {
   await session.ready();
   previewer = new L.Previewer(luna, session);
   previewer.oneShotRepeat = P.oneshot;
+  previewer.loopStart = P.loopStart;
   const t = session.transport;
   // You stopped LUNA: clear the preview clips, leave the transport alone.
   keep(t.playing.onChange(() => {

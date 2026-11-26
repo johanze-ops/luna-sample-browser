@@ -21,7 +21,9 @@ opens in the right-hand browser panel.
 - **Add a folder:** click **+ Folder** and pick a sample folder, or drag one from Finder
   onto the panel. LUNA asks you to allow it the first time. Pick a folder of samples, not a
   whole drive or your home folder, which LUNA won't allow.
-- **Audition:** click a loop. If the session is playing, the loop comes in at the next bar.
+- **Audition:** click a loop. If the session is playing, the loop comes in on the next beat,
+  in time with the bar (or on the next bar: see Settings). The waveform of the selected
+  sample shows below the list.
   If it's stopped, the session starts playing from the playhead's bar. With LUNA's loop on,
   the preview fills the loop range, so it plays every time round.
 - **Search:** type in the search box. It searches the folder you're in and every folder
@@ -45,13 +47,15 @@ opens in the right-hand browser panel.
 - **Drag:** drag a sample from the list onto LUNA's timeline: onto a track to add it there,
   or onto empty space for a new track. It lands at the start of the bar you drop it in, at
   the browser's tempo, and a new track gets the Sample Preview track's warp mode, as
-  **New track** does. It works while the session plays, and the preview stops when it lands.
+  **New track** does. With LUNA's loop on, a loop dropped inside the loop range fills the
+  whole range instead. It works while the session plays, and the preview stops when it lands.
 - **Keys:** ↑ and ↓ step through samples (they play as you go, unless you untick *Play on
   select* in Settings), → opens a folder, ← goes back up, **Esc** stops, **/** jumps to the
   search and **?** shows every shortcut.
 - **Settings:** the tempo range for detected tempos, the preview volume (the Sample Preview
-  track's fader), *Play on select*, and **Ignore folders**: words that hide any folder whose
-  name contains them (for example `old, _bak, presets`).
+  track's fader), whether loops start on the next beat or the next bar, *Play on select*,
+  and **Ignore folders**: words that hide any folder whose name contains them (for example
+  `old, _bak, presets`).
 
 ## Tempo
 

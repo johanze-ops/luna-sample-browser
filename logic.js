@@ -115,6 +115,31 @@ const AddOnLogic = {
   },
 
   /**
+   * A waveform's outline: the decoded `channels` (Float32Arrays, -1..1) cut into `columns`
+   * equal spans, each with the lowest and highest sample across all channels. Every span
+   * starts from 0, so silence draws on the zero line, as LUNA draws its own. Returns
+   * { min, max }, two Float32Arrays of `columns`.
+   */
+  wavePeaks(channels, columns) {
+    const min = new Float32Array(columns), max = new Float32Array(columns);
+    const n = channels[0]?.length ?? 0;
+    if (!n || columns < 1) return { min, max };
+    for (let c = 0; c < columns; c++) {
+      const from = Math.floor((c * n) / columns), to = Math.max(from + 1, Math.floor(((c + 1) * n) / columns));
+      let lo = 0, hi = 0;
+      for (const ch of channels) {
+        for (let i = from; i < to && i < n; i++) {
+          const v = ch[i];
+          if (v < lo) lo = v; else if (v > hi) hi = v;
+        }
+      }
+      min[c] = lo;
+      max[c] = hi;
+    }
+    return { min, max };
+  },
+
+  /**
    * The loop laid end to end from `anchor`, cut to the `ranges` ([start, stop) in ticks) it may
    * occupy. A piece cut from the middle of a pass says where in the file it starts and stops, so
    * the pattern stays in phase with `anchor` however it is cut.
@@ -325,6 +350,7 @@ class Previewer {
     this.luna = luna;
     this.session = session;
     this.aheadBars = aheadBars;
+    this.loopStart = 'beat'; // while playing, a loop comes in on the next 'beat' or 'bar'
     this.sources = new Map(); // file path -> source uid
     this.clipUids = [];
     this.current = null; // { path, name, plan, startTick, lengthTicks, coveredUntil, kind }
@@ -345,6 +371,13 @@ class Previewer {
       await new Promise((r) => setTimeout(r, 25));
     }
     return this.session.transaction(name, fn);
+  }
+
+  /** The id of the newest entry in LUNA's undo list (undefined when it can't be read). */
+  async undoUid() {
+    if (!this.luna?.raw) return undefined;
+    const n = await this.luna.raw.get(this.session.path, { children: false, commands: false, propfilter: 'undo_uid', flatvalue: true }).catch(() => null);
+    return n?.properties?.undo_uid;
   }
 
   /**
@@ -413,9 +446,11 @@ class Previewer {
   async insertPieces(track, sourceUid, pieces, lengthFollows, algType) {
     const uids = [];
     for (const p of pieces) {
+      // Whole numbers only: LUNA refuses a fractional tick (uasrv.invalid_property), and a
+      // one-shot's end from tickAtSeconds can come out as 3576248163215.9995 (2026-11-26).
       const clip = await this.session.insertClip({
-        trackUid: track.id, sourceUid, startTick: p.startTick, stopTick: p.stopTick, lengthFollows,
-        sourceStartNs: p.sourceStartNs, sourceStopNs: p.sourceStopNs,
+        trackUid: track.id, sourceUid, startTick: Math.round(p.startTick), stopTick: Math.round(p.stopTick), lengthFollows,
+        sourceStartNs: Math.round(p.sourceStartNs), sourceStopNs: Math.round(p.sourceStopNs),
         ...(algType ? { algType } : {}),
         ...(p.name ? { name: p.name } : {}),
       });
@@ -494,7 +529,7 @@ class Previewer {
       // (oneShotRepeat), so a kick plays in time instead of once at a random moment.
       const repeat = plan.kind === 'oneshot' ? this.oneShotRepeat : null;
       let kind = plan.kind === 'loop' ? 'loop' : repeat && repeat !== 'once' ? 'repeat' : 'once';
-      let pieces, lengthTicks = null, hitTicks = null, startTick, loop = null, gap = null;
+      let pieces, lengthTicks = null, hitTicks = null, startTick, loop = null, gap = null, anchor = null;
       const lengthFollows = kind === 'loop' ? 'ticks' : 'time';
       if (kind === 'once') {
         startTick = playing ? AddOnLogic.nextBeatTick(tl, here) : (t.playStart.value ?? here);
@@ -502,7 +537,11 @@ class Previewer {
       } else {
         const from = playing ? here : (t.playStart.value ?? here);
         const onBeat = kind === 'repeat' && repeat === 'beat';
-        startTick = onBeat
+        // While playing, a loop comes in on the next beat (loopStart 'beat') or the next bar. On
+        // a beat it joins in phase with its bar, where it would be had it started on the
+        // downbeat, so the loop's downbeat still lands on the bar line.
+        const beatGrid = onBeat || (kind === 'loop' && playing && this.loopStart === 'beat');
+        startTick = beatGrid
           ? (playing ? AddOnLogic.nextBeatTick(tl, here) : AddOnLogic.beatStartTick(tl, from))
           : (playing ? AddOnLogic.nextBarTick(tl, here) : AddOnLogic.barStartTick(tl, from));
         if (kind === 'loop') lengthTicks = AddOnLogic.loopTicks(seconds, plan.bpm, plan.bars);
@@ -520,13 +559,16 @@ class Previewer {
           // the playhead has passed it, so the sample still comes in at the next one.
           const [a, b] = loop;
           startTick = Math.min(startTick, b);
-          const cellStart = onBeat ? AddOnLogic.beatStartTick(tl, here) : AddOnLogic.barStartTick(tl, here);
+          const cellStart = beatGrid ? AddOnLogic.beatStartTick(tl, here) : AddOnLogic.barStartTick(tl, here);
           gap = playing ? [Math.max(a, cellStart), startTick] : null;
           pieces = cutFor(a, gap ? [[a, gap[0]], [gap[1], b]] : [[a, b]]);
           if (gap && !(gap[1] > gap[0])) gap = null;
         } else {
+          // A loop is in phase with the bar it comes in on; the copies end on a whole pass.
+          anchor = kind === 'loop' ? AddOnLogic.barStartTick(tl, startTick) : startTick;
           const span = Math.max(2 * lengthTicks, Math.ceil((this.aheadBars * barTicks) / lengthTicks) * lengthTicks);
-          pieces = cutFor(startTick, [[startTick, startTick + span]]);
+          const end = anchor + Math.ceil((startTick + span - anchor) / lengthTicks) * lengthTicks;
+          pieces = cutFor(anchor, [[startTick, end]]);
         }
       }
 
@@ -537,8 +579,9 @@ class Previewer {
         await this.deleteClips(old);
         this.clipUids = await this.insertPieces(track, src.id, pieces, lengthFollows);
       });
-      const coveredUntil = loop ? loop[1] : (kind === 'once' ? pieces[0].stopTick : startTick + Math.ceil((Math.max(...pieces.map((p) => p.stopTick)) - startTick) / lengthTicks) * lengthTicks);
-      this.current = { path: file.path, name: file.name, sourceUid: src.id, plan, seconds, srcNs, startTick, lengthTicks, hitTicks, coveredUntil, kind, loop, gap };
+      const phase = anchor ?? startTick; // where a whole pass begins
+      const coveredUntil = loop ? loop[1] : (kind === 'once' ? pieces[0].stopTick : phase + Math.ceil((Math.max(...pieces.map((p) => p.stopTick)) - phase) / lengthTicks) * lengthTicks);
+      this.current = { path: file.path, name: file.name, sourceUid: src.id, plan, seconds, srcNs, startTick, phaseTick: phase, lengthTicks, hitTicks, coveredUntil, kind, loop, gap };
       if (!playing) {
         if (plan.kind === 'loop') await this.waitForRender();
         await t.play();
@@ -634,35 +677,51 @@ class Previewer {
   /**
    * Put `file` ({ path, name }) at `startTick`, as Add would: on `track`, or on a new track
    * with the Sample Preview track's warp mode. A loop gets one pass warped to tempoFor's tempo,
-   * a one-shot plays once at its own speed. This replaces a drop onto LUNA's timeline, which
-   * gets LUNA's own warp mode and tempo instead. `loopsOnBar` starts a loop at the start of the
-   * bar `startTick` is in (LUNA snaps a drop to its grid, often a beat). `stopPreview` takes
-   * the preview's clips away in the same undo step (the transport keeps going). Returns
-   * { track, clips, plan, startTick }.
+   * or, when LUNA is looping and `startTick` is inside the loop range, fills the whole range in
+   * phase with its start (as Add does); a one-shot plays once at its own speed. This replaces
+   * a drop onto LUNA's timeline, which gets LUNA's own warp mode and tempo instead. `loopsOnBar`
+   * starts a single pass at the start of the bar `startTick` is in (LUNA snaps a drop to its
+   * grid, often a beat). `stopPreview` takes the preview's clips away in the same undo step
+   * (the transport keeps going). `loopRange` ([start, stop] or null for none) stands in for
+   * LUNA's loop range now: a drop moves the range onto the dropped clip, so the caller passes
+   * the one noted before the drag. Returns { track, clips, plan, startTick, filledLoop }.
    */
-  placeAt(file, tempoFor, { track: target = null, startTick, loopsOnBar = false, stopPreview = false }) {
+  placeAt(file, tempoFor, { track: target = null, startTick, loopsOnBar = false, stopPreview = false, loopRange } = {}) {
     return this.queue(async () => {
       const tl = this.session.musical.timeline;
       const src = await this.source(file.path);
       const seconds = src.seconds ?? (src.length.value ?? 0) / 1e9;
       const srcNs = src.length.value ?? Math.round(seconds * 1e9);
       const plan = tempoFor(seconds);
-      if (loopsOnBar && plan.kind === 'loop') startTick = AddOnLogic.barStartTick(tl, startTick);
+      const inside = (r) => (r && startTick >= r[0] && startTick < r[1] ? r : null);
+      const loop = plan.kind !== 'loop' ? null : loopRange === undefined ? this.loopRange(startTick) : inside(loopRange);
+      if (loop) startTick = loop[0];
+      else if (loopsOnBar && plan.kind === 'loop') startTick = AddOnLogic.barStartTick(tl, startTick);
       const name = file.name.replace(/\.[^.]+$/, '');
       const preview = this.findTrack();
       const algName = preview ? ALG_TYPES[await this.trackAlg(preview)] : undefined;
       const track = target ?? (await this.newTrackLike(name, algName));
-      const pieces = plan.kind === 'loop'
-        ? this.passes(startTick, AddOnLogic.loopTicks(seconds, plan.bpm, plan.bars), 1, srcNs)
-        : [{ startTick, stopTick: tl.tickAtSeconds(tl.seconds(startTick) + seconds), sourceStartNs: 0, sourceStopNs: srcNs }];
+      const madeTrack = target ? null : await this.undoUid(); // the "New Track" entry, if any
+      const lengthTicks = plan.kind === 'loop' ? AddOnLogic.loopTicks(seconds, plan.bpm, plan.bars) : 0;
+      const pieces = loop
+        ? AddOnLogic.tilePieces(loop[0], lengthTicks, [loop], srcNs)
+        : plan.kind === 'loop'
+          ? this.passes(startTick, lengthTicks, 1, srcNs)
+          : [{ startTick, stopTick: tl.tickAtSeconds(tl.seconds(startTick) + seconds), sourceStartNs: 0, sourceStopNs: srcNs }];
       for (const p of pieces) p.name = name;
       const keepFirst = this.firstClip;
       let uids;
       const previews = stopPreview ? this.clipUids : [];
-      await this.tx('Add Sample', async () => {
-        await this.deleteClips(previews);
-        uids = await this.insertPieces(track, src.id, pieces, plan.kind === 'loop' ? 'ticks' : 'time', algName);
-      });
+      try {
+        await this.tx('Add Sample', async () => {
+          await this.deleteClips(previews);
+          uids = await this.insertPieces(track, src.id, pieces, plan.kind === 'loop' ? 'ticks' : 'time', algName);
+        });
+      } catch (err) {
+        // Don't leave an empty new track behind: undo it while it is still the newest entry.
+        if (madeTrack && (await this.undoUid()) === madeTrack) await this.session.undo(1).catch(() => undefined);
+        throw err;
+      }
       this.firstClip = keepFirst;
       if (stopPreview) {
         this.clipUids = [];
@@ -670,7 +729,7 @@ class Previewer {
         this.firstClip = null;
         this.startedTransport = false; // as stop({ stopTransport: false })
       }
-      return { track, clips: uids.length, plan, startTick };
+      return { track, clips: uids.length, plan, startTick, filledLoop: loop };
     });
   }
 
@@ -686,7 +745,7 @@ class Previewer {
       let pieces;
       const loop = cur.kind === 'loop' ? (this.loopRange(cur.startTick) ?? (cur.loop && this.session.transport.looping.value ? cur.loop : null)) : null;
       if (loop) pieces = AddOnLogic.tilePieces(loop[0], cur.lengthTicks, [loop], cur.srcNs);
-      else if (cur.kind === 'loop') pieces = this.passes(cur.startTick, cur.lengthTicks, 1, cur.srcNs);
+      else if (cur.kind === 'loop') pieces = this.passes(cur.phaseTick ?? cur.startTick, cur.lengthTicks, 1, cur.srcNs); // from the bar it came in on
       else pieces = [{ startTick: cur.startTick, stopTick: tl.tickAtSeconds(tl.seconds(cur.startTick) + cur.seconds), sourceStartNs: 0, sourceStopNs: cur.srcNs }];
       for (const p of pieces) p.name = name;
       const keepFirst = this.firstClip;

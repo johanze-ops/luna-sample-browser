@@ -289,3 +289,150 @@ describe('one preview job’s transaction at a time', () => {
     expect(queued).toBe(1);
   });
 });
+
+describe('a dropped loop and LUNA’s loop range', () => {
+  // placeAt with the engine work stubbed out: what it would insert, on the mock's tempo map.
+  async function drop({ looping, range, at, seconds = 2, plan = { kind: 'loop', bpm: 120, bars: 1 }, noted }) {
+    const { session } = await connected();
+    const tl = session.musical.timeline;
+    const bar = (n) => tl.tickAt({ bar: n });
+    const transport = { looping: { value: looping }, loopStart: { value: bar(range[0]) }, loopStop: { value: bar(range[1]) } };
+    const p = new L.Previewer(null, { musical: session.musical, transport });
+    let inserted = null;
+    p.source = async () => ({ id: 'src', seconds, length: { value: seconds * 1e9 } });
+    p.findTrack = () => null;
+    p.newTrackLike = async (name) => ({ name: { value: name } });
+    p.tx = async (_name, fn) => fn();
+    p.insertPieces = async (_track, _src, pieces) => { inserted = pieces; return pieces.map((_, i) => `c${i}`); };
+    const placed = await p.placeAt({ path: '/x/loop.wav', name: 'loop.wav' }, () => plan, { startTick: at(bar, tl), loopsOnBar: true, ...(noted ? { loopRange: noted(bar) } : {}) });
+    return { placed, inserted, bar };
+  }
+
+  it('fills the whole loop range, in time with its start, when dropped inside it', async () => {
+    const { placed, inserted, bar } = await drop({ looping: true, range: [5, 9], at: (bar) => bar(6) + Luna.TICKS_PER_BEAT });
+    expect(placed.filledLoop).toEqual([bar(5), bar(9)]);
+    expect(inserted[0].startTick).toBe(bar(5));
+    expect(inserted.at(-1).stopTick).toBe(bar(9));
+    expect(inserted).toHaveLength(4); // a 1-bar loop, 4 bars
+  });
+
+  it('adds one pass from the bar when dropped outside the range, or with looping off', async () => {
+    for (const [looping, at] of [[true, (bar) => bar(12) + Luna.TICKS_PER_BEAT], [false, (bar) => bar(6) + Luna.TICKS_PER_BEAT]]) {
+      const { placed, inserted, bar } = await drop({ looping, range: [5, 9], at });
+      expect(placed.filledLoop).toBeNull();
+      expect(inserted).toHaveLength(1);
+      expect(inserted[0].startTick).toBe(at(bar) - Luna.TICKS_PER_BEAT);
+    }
+  });
+
+  it('fills the range noted before the drag, after LUNA moved its own range onto the drop', async () => {
+    // LUNA's range now covers just its dropped clip (bar 6 to 7); the range set before was bar 5 to 9.
+    const { placed, inserted, bar } = await drop({ looping: true, range: [6, 7], at: (bar) => bar(6), noted: (bar) => [bar(5), bar(9)] });
+    expect(placed.filledLoop).toEqual([bar(5), bar(9)]);
+    expect(inserted).toHaveLength(4);
+    const none = await drop({ looping: true, range: [6, 7], at: (bar) => bar(6), noted: () => null });
+    expect(none.placed.filledLoop).toBeNull(); // no range before the drag: one pass, whatever LUNA did
+    expect(none.inserted).toHaveLength(1);
+  });
+
+  it('plays a one-shot once where it was dropped, even inside the range', async () => {
+    const { placed, inserted, bar } = await drop({ looping: true, range: [5, 9], at: (bar) => bar(6) + Luna.TICKS_PER_BEAT, seconds: 0.4, plan: { kind: 'oneshot' } });
+    expect(placed.filledLoop).toBeNull();
+    expect(inserted).toHaveLength(1);
+    expect(inserted[0].startTick).toBe(bar(6) + Luna.TICKS_PER_BEAT);
+  });
+});
+
+describe('clip positions LUNA accepts', () => {
+  it('rounds every tick and nanosecond to a whole number', async () => {
+    // LUNA refused a one-shot ending at tick 3576248163215.9995 (2026-11-26).
+    const sent = [];
+    const p = new L.Previewer(null, { insertClip: async (o) => { sent.push(o); return { id: `c${sent.length}` }; } });
+    await p.insertPieces({ id: 't' }, 's', [{ startTick: 3456000000000, stopTick: 3576248163215.9995, sourceStartNs: 0.4, sourceStopNs: 835056689.0000001 }], 'time', 'razor_blade');
+    const o = sent[0];
+    for (const k of ['startTick', 'stopTick', 'sourceStartNs', 'sourceStopNs']) expect(Number.isInteger(o[k])).toBe(true);
+    expect(o.stopTick).toBe(3576248163216);
+  });
+});
+
+describe('a drop that fails to add', () => {
+  it('takes away the new track it made, and says why', async () => {
+    const { session } = await connected();
+    let undid = 0, uid = 'before';
+    const fake = { musical: session.musical, path: '/sessions/x', transport: { looping: { value: false } }, undo: async (n) => { undid += n; } };
+    const luna = { raw: { get: async () => ({ properties: { undo_uid: uid } }) } };
+    const p = new L.Previewer(luna, fake);
+    p.source = async () => ({ id: 'src', seconds: 0.5, length: { value: 5e8 } });
+    p.findTrack = () => null;
+    p.newTrackLike = async (name) => { uid = 'new-track'; return { name: { value: name } }; };
+    p.tx = async () => { throw Object.assign(new Error('refused'), { code: 'uasrv.invalid_property' }); };
+    await expect(p.placeAt({ path: '/x/hit.wav', name: 'hit.wav' }, () => ({ kind: 'oneshot' }), { startTick: 0 })).rejects.toThrow('refused');
+    expect(undid).toBe(1);
+    // …but not when something else has come into the undo list meanwhile
+    undid = 0;
+    p.newTrackLike = async (name) => { uid = 'new-track'; return { name: { value: name } }; };
+    p.tx = async () => { uid = 'someone-else'; throw new Error('refused'); };
+    await expect(p.placeAt({ path: '/x/hit.wav', name: 'hit.wav' }, () => ({ kind: 'oneshot' }), { startTick: 0 })).rejects.toThrow();
+    expect(undid).toBe(0);
+  });
+});
+
+describe('the waveform outline', () => {
+  it('takes the lowest and highest sample of each span, across channels', () => {
+    const left = new Float32Array([0.5, -0.2, 0, 0, 0.1, 0.9, 0, 0]);
+    const right = new Float32Array([0, -0.7, 0, 0, 0, 0, -0.3, 0]);
+    const { min, max } = L.wavePeaks([left, right], 4);
+    expect(Array.from(max).map((v) => +v.toFixed(2))).toEqual([0.5, 0, 0.9, 0]);
+    expect(Array.from(min).map((v) => +v.toFixed(2))).toEqual([-0.7, 0, 0, -0.3]);
+  });
+  it('keeps silence on the zero line and copes with more columns than samples', () => {
+    const { min, max } = L.wavePeaks([new Float32Array([0.25, 0.25])], 6);
+    expect(min.every((v) => v === 0)).toBe(true); // every span starts from 0
+    expect(Array.from(max)).toEqual([0.25, 0.25, 0.25, 0.25, 0.25, 0.25]);
+    expect(L.wavePeaks([new Float32Array(0)], 4).max).toHaveLength(4);
+  });
+});
+
+describe('when a clicked loop comes in while the session plays', () => {
+  async function audition(loopStart, here) {
+    const { session } = await connected();
+    const tl = session.musical.timeline;
+    const bar = (n) => tl.tickAt({ bar: n });
+    const transport = { playing: { value: true }, tick: here(bar), playStart: { value: 0 }, looping: { value: false }, loopStart: { value: 0 }, loopStop: { value: 0 } };
+    const p = new L.Previewer(null, { musical: session.musical, transport }, { aheadBars: 4 });
+    p.loopStart = loopStart;
+    let inserted = null, added = null;
+    p.track = async () => ({ id: 'preview' });
+    p.source = async () => ({ id: 'src', seconds: 2, length: { value: 2e9 } });
+    p.clipsOnTrack = async () => [];
+    p.tx = async (_name, fn) => fn();
+    p.insertPieces = async (_track, _src, pieces) => { if (inserted) added = pieces; else inserted = pieces; return pieces.map((_, i) => `c${i}`); };
+    const cur = await p.audition({ path: '/x/loop.wav', name: 'loop.wav' }, () => ({ kind: 'loop', bpm: 120, bars: 1 }));
+    return { cur, inserted, bar, p, get added() { return added; } };
+  }
+  const beat = Luna.TICKS_PER_BEAT;
+
+  it('comes in on the next beat, in phase with its bar', async () => {
+    const { cur, inserted, bar } = await audition('beat', (bar) => bar(5) + 1.5 * beat);
+    expect(inserted[0].startTick).toBe(bar(5) + 2 * beat);
+    expect(inserted[0].sourceStartNs).toBe(1e9); // half-way into the 1-bar loop
+    expect(inserted[1].startTick).toBe(bar(6)); // the next pass starts on the bar line
+    expect(cur.phaseTick).toBe(bar(5));
+    expect((cur.coveredUntil - bar(5)) % (bar(6) - bar(5))).toBe(0); // more copies follow on whole passes
+  });
+
+  it('or on the next bar, as before', async () => {
+    const { inserted, bar } = await audition('bar', (bar) => bar(5) + 1.5 * beat);
+    expect(inserted[0].startTick).toBe(bar(6));
+    expect(inserted[0].sourceStartNs).toBe(0);
+  });
+
+  it('is added from the bar it came in on', async () => {
+    const t = await audition('beat', (bar) => bar(5) + 1.5 * beat);
+    t.p.newTrackLike = async (name) => ({ name: { value: name } });
+    t.p.trackAlg = async () => 5;
+    await t.p.add(null);
+    expect(t.added[0].startTick).toBe(t.bar(5));
+    expect(t.added[0].sourceStartNs).toBe(0);
+  });
+});
