@@ -10,11 +10,16 @@ const ONE_SHOT_MAX_SECONDS = 1.2; // shorter than this, with no BPM in the name:
 const PREVIEW_TRACK_NAME = 'Sample Preview';
 // LUNA's warp modes: a track stores the index, a clip the name (track 5 <-> clip 'razor_blade', measured).
 const ALG_TYPES = ['polyphonic', 'monophonic', 'efficient', 'soloist', 'varispeed', 'razor_blade', 'ua_stretch', 'clip_effect'];
+// LUNA's undo-list names for a file dropped on its timeline (measured, LUNA 3.1.2, 2026-11-26).
+const DROP_UNDO_NAME = 'Drag and Drop';
+const DETECT_UNDO_NAME = 'Apply Instrument Detection to Tracks';
 
 const AddOnLogic = {
   AUDIO_EXT,
   ONE_SHOT_MAX_SECONDS,
   PREVIEW_TRACK_NAME,
+  DROP_UNDO_NAME,
+  DETECT_UNDO_NAME,
 
   isAudio(name) {
     return AUDIO_EXT.test(name ?? '');
@@ -212,6 +217,58 @@ const AddOnLogic = {
     return query.alts.some((all) => all.every((w) => t.includes(w)));
   },
 
+  /**
+   * Everything below `folder`, past LUNA's listing limit. `io.listAll` is luna.gui.listAllFiles
+   * and `io.listDir` luna.gui.listFiles. listAllFiles stops at 10,000 entries (or 5 s) and
+   * lists depth first, so what it returned is a prefix: every top-level entry it got to is
+   * complete except the last one, if that is a folder. Keep those, then list the rest one
+   * folder at a time (a few at once), splitting again wherever a folder is still too big.
+   * A folder that can't be listed (a link out of the blessed folders) is left out.
+   * Returns { files, truncated } like listAllFiles; truncated only if it ran out of depth.
+   */
+  async listTree(folder, io, depth = 0) {
+    const { files, truncated } = await io.listAll(folder);
+    if (!truncated || depth >= 40) return { files, truncated };
+    const top = files.filter((f) => !f.relativePath.includes('/'));
+    const done = new Set(top.map((f) => f.name));
+    if (top.at(-1)?.isDirectory) done.delete(top.at(-1).name);
+    const kept = files.filter((f) => done.has(f.relativePath.split('/')[0]));
+    const rest = (await io.listDir(folder)).filter((c) => !done.has(c.name));
+    let cut = false;
+    const parts = await AddOnLogic.mapLimit(rest, io.concurrency ?? 8, async (c) => {
+      const here = [{ ...c, relativePath: c.name }];
+      if (!c.isDirectory) return here;
+      let sub;
+      try { sub = await AddOnLogic.listTree(c.path, io, depth + 1); } catch { return here; }
+      cut ||= sub.truncated;
+      return here.concat(sub.files.map((f) => ({ ...f, relativePath: `${c.name}/${f.relativePath}` })));
+    });
+    return { files: kept.concat(...parts), truncated: cut };
+  },
+
+  /**
+   * After a sample was dragged onto LUNA's timeline: how many of the newest undo entries are
+   * LUNA's drop, so undoing them takes exactly the drop back. `names` are the entries made
+   * since the drag started, oldest first. LUNA's drop is one "Drag and Drop", followed by an
+   * "Apply Instrument Detection to Tracks" when it analysed a fresh import. Entries before the
+   * drop are fine (they stay); anything after it, or a second drop, gives null: leave it alone.
+   */
+  dropUndoCount(names) {
+    const drops = names.flatMap((n, i) => (n === DROP_UNDO_NAME ? [i] : []));
+    if (drops.length !== 1) return null;
+    const after = names.slice(drops[0] + 1);
+    return after.every((n) => n === DETECT_UNDO_NAME) ? after.length + 1 : null;
+  },
+
+  /** `fn` over `items`, at most `limit` at a time, answers in the items' order. */
+  async mapLimit(items, limit, fn) {
+    const out = new Array(items.length);
+    let next = 0;
+    const worker = async () => { while (next < items.length) { const i = next++; out[i] = await fn(items[i], i); } };
+    await Promise.all(Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, worker));
+    return out;
+  },
+
   /** Words from the "ignore folders" setting: comma or space separated. */
   ignoreWords(setting) {
     return String(setting ?? '').toLowerCase().split(/[,\s]+/).map((w) => w.trim()).filter(Boolean);
@@ -273,6 +330,21 @@ class Previewer {
     this.current = null; // { path, name, plan, startTick, lengthTicks, coveredUntil, kind }
     this.startedTransport = false;
     this.busy = Promise.resolve();
+    this.held = false; // true while a sample is being dragged out: the preview adds nothing
+  }
+
+  /**
+   * A transaction for one job. The SDK runs a transaction opened while another is still open
+   * inside that one, and a batch shows nothing until it commits: so if a job given up on by
+   * queue() is still holding its batch open, every audition after it would vanish into it.
+   * Wait for the open one to finish instead, and fail with an error rather than nest.
+   */
+  async tx(name, fn, waitMs = 10000) {
+    for (let waited = 0; this.session.batching; waited += 25) {
+      if (waited >= waitMs) throw new Error('LUNA is still finishing an earlier change');
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    return this.session.transaction(name, fn);
   }
 
   /**
@@ -461,7 +533,7 @@ class Previewer {
       const old = [...new Set([...this.clipUids, ...(await this.clipsOnTrack(track))])];
       this.clipUids = [];
       this.firstClip = null;
-      await this.session.transaction('Preview', async () => {
+      await this.tx('Preview', async () => {
         await this.deleteClips(old);
         this.clipUids = await this.insertPieces(track, src.id, pieces, lengthFollows);
       });
@@ -489,7 +561,9 @@ class Previewer {
 
   extend() {
     const cur = this.current;
-    if (!cur || cur.kind === 'once' || this.extending) return Promise.resolve();
+    // Held while a sample is dragged out: a preview entry after LUNA's drop would stop the
+    // browser putting the dropped sample right.
+    if (!cur || cur.kind === 'once' || this.extending || this.held) return Promise.resolve();
     const follows = cur.kind === 'loop' ? 'ticks' : 'time';
     const t = this.session.transport;
     const tick = t.tick;
@@ -501,7 +575,7 @@ class Previewer {
         if (this.current !== cur) return;
         const track = await this.track();
         const pieces = this.cut(cur, cur.loop[0], [gap]);
-        await this.session.transaction('Preview', async () => {
+        await this.tx('Preview', async () => {
           this.clipUids.push(...(await this.insertPieces(track, cur.sourceUid, pieces, follows)));
         });
       }).finally(() => { this.extending = false; });
@@ -516,21 +590,26 @@ class Previewer {
       const track = await this.track();
       const until = cur.coveredUntil + Math.max(1, Math.ceil((this.aheadBars * barTicks) / cur.lengthTicks)) * cur.lengthTicks;
       const pieces = this.cut(cur, cur.coveredUntil, [[cur.coveredUntil, until]]);
-      await this.session.transaction('Preview', async () => {
+      await this.tx('Preview', async () => {
         this.clipUids.push(...(await this.insertPieces(track, cur.sourceUid, pieces, follows)));
       });
       cur.coveredUntil = until;
     }).finally(() => { this.extending = false; });
   }
 
-  /** Stop auditioning: remove the preview clips, and stop the transport if we started it. */
-  stop({ stopTransport = true } = {}) {
+  /**
+   * Stop auditioning: remove the preview clips, and stop the transport if we started it.
+   * `onlyOwn` removes just the clips this page placed, leaving anything else on the track
+   * (a sample the user just dragged onto it).
+   */
+  stop({ stopTransport = true, onlyOwn = false } = {}) {
     return this.queue(async () => {
       const track = this.findTrack();
-      const uids = [...new Set([...this.clipUids, ...(track ? await this.clipsOnTrack(track) : [])])];
+      const others = !onlyOwn && track ? await this.clipsOnTrack(track) : [];
+      const uids = [...new Set([...this.clipUids, ...others])];
       this.clipUids = [];
       this.current = null;
-      if (uids.length) await this.session.transaction('Preview', () => this.deleteClips(uids));
+      if (uids.length) await this.tx('Preview', () => this.deleteClips(uids));
       if (stopTransport && this.startedTransport && this.session.transport.playing.value) await this.session.transport.stop();
       this.startedTransport = false;
     });
@@ -552,6 +631,49 @@ class Previewer {
     return this.add(track);
   }
 
+  /**
+   * Put `file` ({ path, name }) at `startTick`, as Add would: on `track`, or on a new track
+   * with the Sample Preview track's warp mode. A loop gets one pass warped to tempoFor's tempo,
+   * a one-shot plays once at its own speed. This replaces a drop onto LUNA's timeline, which
+   * gets LUNA's own warp mode and tempo instead. `loopsOnBar` starts a loop at the start of the
+   * bar `startTick` is in (LUNA snaps a drop to its grid, often a beat). `stopPreview` takes
+   * the preview's clips away in the same undo step (the transport keeps going). Returns
+   * { track, clips, plan, startTick }.
+   */
+  placeAt(file, tempoFor, { track: target = null, startTick, loopsOnBar = false, stopPreview = false }) {
+    return this.queue(async () => {
+      const tl = this.session.musical.timeline;
+      const src = await this.source(file.path);
+      const seconds = src.seconds ?? (src.length.value ?? 0) / 1e9;
+      const srcNs = src.length.value ?? Math.round(seconds * 1e9);
+      const plan = tempoFor(seconds);
+      if (loopsOnBar && plan.kind === 'loop') startTick = AddOnLogic.barStartTick(tl, startTick);
+      const name = file.name.replace(/\.[^.]+$/, '');
+      const preview = this.findTrack();
+      const algName = preview ? ALG_TYPES[await this.trackAlg(preview)] : undefined;
+      const track = target ?? (await this.newTrackLike(name, algName));
+      const pieces = plan.kind === 'loop'
+        ? this.passes(startTick, AddOnLogic.loopTicks(seconds, plan.bpm, plan.bars), 1, srcNs)
+        : [{ startTick, stopTick: tl.tickAtSeconds(tl.seconds(startTick) + seconds), sourceStartNs: 0, sourceStopNs: srcNs }];
+      for (const p of pieces) p.name = name;
+      const keepFirst = this.firstClip;
+      let uids;
+      const previews = stopPreview ? this.clipUids : [];
+      await this.tx('Add Sample', async () => {
+        await this.deleteClips(previews);
+        uids = await this.insertPieces(track, src.id, pieces, plan.kind === 'loop' ? 'ticks' : 'time', algName);
+      });
+      this.firstClip = keepFirst;
+      if (stopPreview) {
+        this.clipUids = [];
+        this.current = null;
+        this.firstClip = null;
+        this.startedTransport = false; // as stop({ stopTransport: false })
+      }
+      return { track, clips: uids.length, plan, startTick };
+    });
+  }
+
   add(target) {
     return this.queue(async () => {
       const cur = this.current;
@@ -569,7 +691,7 @@ class Previewer {
       for (const p of pieces) p.name = name;
       const keepFirst = this.firstClip;
       let uids;
-      await this.session.transaction('Add Sample', async () => {
+      await this.tx('Add Sample', async () => {
         uids = await this.insertPieces(track, cur.sourceUid, pieces, cur.kind === 'loop' ? 'ticks' : 'time', algName);
       });
       this.firstClip = keepFirst;

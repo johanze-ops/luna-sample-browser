@@ -42,6 +42,10 @@ opens in the right-hand browser panel.
   **To track** (Shift+Enter) puts it on the track you have selected in LUNA. A loop fills
   the loop range when LUNA is looping, and otherwise one pass is added from the bar the
   preview started on. A new track gets the same warp mode as the Sample Preview track.
+- **Drag:** drag a sample from the list onto LUNA's timeline: onto a track to add it there,
+  or onto empty space for a new track. It lands at the start of the bar you drop it in, at
+  the browser's tempo, and a new track gets the Sample Preview track's warp mode, as
+  **New track** does. It works while the session plays, and the preview stops when it lands.
 - **Keys:** ↑ and ↓ step through samples (they play as you go, unless you untick *Play on
   select* in Settings), → opens a folder, ← goes back up, **Esc** stops, **/** jumps to the
   search and **?** shows every shortcut.
@@ -67,6 +71,10 @@ The label next to each loop says which one it used. If a loop is at the wrong sp
 - Auditioning while the session is stopped starts the whole session playing, because LUNA
   can only play the preview through its transport.
 - Each audition adds one "Preview" step to LUNA's undo history.
+- When you drag a sample out, LUNA places it first, with its own warp mode and tempo guess.
+  The browser then undoes that and adds the sample itself, so you may see it jump for a
+  moment. If anything else changes in the session meanwhile, the browser leaves LUNA's
+  version alone and says so.
 - Each sample you audition is copied into the session's audio folder. LUNA's unused-media
   cleanup removes the ones you didn't keep.
 - Tempo detection uses a LUNA engine command that isn't part of the documented Add On API.

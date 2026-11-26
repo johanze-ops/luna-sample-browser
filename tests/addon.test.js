@@ -172,3 +172,120 @@ describe('bar positions through the tempo map', () => {
     expect(L.barStartTick(tl, bar(3) + Luna.TICKS_PER_BEAT)).toBe(bar(3));
   });
 });
+
+describe('listing past LUNA’s limit', () => {
+  // A fake disk: listAll lists depth first and stops after `limit` entries, as LUNA does.
+  const tree = {
+    'a.wav': 1,
+    Alpha: { 'k1.wav': 1, 'k2.wav': 1, Sub: { 's1.wav': 1, 's2.wav': 1, 's3.wav': 1 } },
+    Beta: { 'b1.wav': 1, Deep: { D2: { 'd1.wav': 1, 'd2.wav': 1, 'd3.wav': 1, 'd4.wav': 1 } } },
+    'm.wav': 1,
+    Oliver: { 'OLIVER_1.wav': 1, 'OLIVER_2.wav': 1, 'OLIVER_3.wav': 1 },
+    'z.wav': 1,
+  };
+  const at = (path) => path.split('/').filter(Boolean).slice(1).reduce((n, k) => n[k], tree);
+  const walk = (node, path, rel, out) => {
+    for (const name of Object.keys(node)) {
+      const isDirectory = typeof node[name] === 'object';
+      const r = rel ? `${rel}/${name}` : name;
+      out.push({ name, path: `${path}/${name}`, isDirectory, relativePath: r });
+      if (isDirectory) walk(node[name], `${path}/${name}`, r, out);
+    }
+    return out;
+  };
+  const io = (limit) => {
+    const calls = { all: 0 };
+    return {
+      calls,
+      concurrency: 3,
+      listAll: async (p) => { calls.all++; const all = walk(at(p), p, '', []); return { files: all.slice(0, limit), truncated: all.length > limit }; },
+      listDir: async (p) => Object.keys(at(p)).map((name) => ({ name, path: `${p}/${name}`, isDirectory: typeof at(p)[name] === 'object' })),
+    };
+  };
+  const full = walk(tree, '/root', '', []);
+
+  it('gives back the same as an unlimited listing, in the same order', async () => {
+    for (const limit of [1, 2, 3, 5, 8, 13, 100]) {
+      const r = await L.listTree('/root', io(limit));
+      expect(r.truncated).toBe(false);
+      expect(r.files.map((f) => f.relativePath)).toEqual(full.map((f) => f.relativePath));
+      expect(r.files.map((f) => f.path)).toEqual(full.map((f) => f.path));
+    }
+  });
+
+  it('makes one call when nothing is cut off', async () => {
+    const x = io(1000);
+    await L.listTree('/root', x);
+    expect(x.calls.all).toBe(1);
+  });
+
+  it('finds files that were past the cut-off', async () => {
+    const r = await L.listTree('/root', io(6));
+    const q = L.parseQuery('oliver');
+    expect(r.files.filter((f) => !f.isDirectory && L.matches(`root/${f.relativePath}`, q)).map((f) => f.name)).toEqual(['OLIVER_1.wav', 'OLIVER_2.wav', 'OLIVER_3.wav']);
+  });
+
+  it('leaves out a folder it may not read', async () => {
+    const x = io(4);
+    const listAll = x.listAll;
+    x.listAll = (p) => (p.endsWith('/Beta') ? Promise.reject(Object.assign(new Error('no'), { code: 'uasrv.not_permitted' })) : listAll(p));
+    const r = await L.listTree('/root', x);
+    expect(r.files.some((f) => f.relativePath.startsWith('Beta/'))).toBe(false);
+    expect(r.files.some((f) => f.relativePath === 'Oliver/OLIVER_3.wav')).toBe(true);
+  });
+});
+
+describe('telling LUNA’s drop apart in the undo list', () => {
+  const D = L.DROP_UNDO_NAME, I = L.DETECT_UNDO_NAME;
+  it('undoes the drop, with its instrument detection', () => {
+    expect(L.dropUndoCount([D])).toBe(1);
+    expect(L.dropUndoCount([D, I])).toBe(2);
+    expect(L.dropUndoCount(['Preview', D, I])).toBe(2); // earlier entries stay
+  });
+  it('leaves it alone when anything else came after, or there is no single drop', () => {
+    expect(L.dropUndoCount([])).toBeNull();
+    expect(L.dropUndoCount(['Preview'])).toBeNull();
+    expect(L.dropUndoCount([D, 'Move Clips'])).toBeNull();
+    expect(L.dropUndoCount([D, I, 'Rename Track'])).toBeNull();
+    expect(L.dropUndoCount([D, D])).toBeNull();
+    expect(L.dropUndoCount([I])).toBeNull();
+  });
+});
+
+describe('one preview job’s transaction at a time', () => {
+  // The SDK runs a transaction opened inside another inside it: one that never ends would hide
+  // every audition after it (2026-11-26).
+  const fakeSession = () => {
+    const calls = [];
+    return { calls, batching: true, transaction: async (name, fn) => { calls.push(name); return fn(); } };
+  };
+  it('waits for an open transaction to end instead of running inside it', async () => {
+    const s = fakeSession();
+    const p = new L.Previewer(null, s);
+    const run = p.tx('Preview', async () => 'done', 2000);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(s.calls).toEqual([]);
+    s.batching = false;
+    await expect(run).resolves.toBe('done');
+    expect(s.calls).toEqual(['Preview']);
+  });
+  it('gives up rather than nest inside one that never ends', async () => {
+    const s = fakeSession();
+    const p = new L.Previewer(null, s);
+    await expect(p.tx('Preview', async () => 1, 100)).rejects.toThrow(/still finishing/);
+    expect(s.calls).toEqual([]);
+  });
+  it('adds nothing to a playing preview while a sample is dragged out', async () => {
+    const p = new L.Previewer(null, fakeSession());
+    let queued = 0;
+    p.queue = () => { queued++; return Promise.resolve(); };
+    p.current = { kind: 'loop', gap: [0, 10], loop: [0, 100], coveredUntil: 0, lengthTicks: 10 };
+    p.session.transport = { tick: 50, looping: { value: false } };
+    p.held = true;
+    await p.extend();
+    expect(queued).toBe(0);
+    p.held = false;
+    p.extend();
+    expect(queued).toBe(1);
+  });
+});

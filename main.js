@@ -147,7 +147,7 @@ async function openFolder(path, { keepSel = null } = {}) {
 async function deepList(folder) {
   const hit = deepCache.get(folder);
   if (hit && Date.now() - hit.at < 60000) return hit;
-  const { files, truncated } = await luna.gui.listAllFiles(folder);
+  const { files, truncated } = await L.listTree(folder, { listAll: (p) => luna.gui.listAllFiles(p), listDir: (p) => luna.gui.listFiles(p) });
   const value = { at: Date.now(), files, truncated };
   deepCache.set(folder, value);
   return value;
@@ -190,7 +190,7 @@ async function refresh({ keepSel = null } = {}) {
         }
       }
       entries = found;
-      if (truncated) note = ' (LUNA stopped listing at 10,000 files: search a folder further down for the rest)';
+      if (truncated) note = ' (some folders are nested too deep to list: search a folder further down for the rest)';
     }
   } catch (e) {
     entries = [];
@@ -252,7 +252,7 @@ function rowHtml(e, i) {
   const dot = e.isDirectory ? '' : `<span class="dot" data-act="colour" title="Colour (C)" style="background:${s?.color ? `var(--c-${s.color})` : 'transparent'}"></span>`;
   const tools = e.isDirectory ? '' : `<span class="tools"><button data-act="half" title="Half the tempo">½×</button><button data-act="double" title="Double the tempo">2×</button>${P.overrides[e.path] ? '<button data-act="reset" title="Back to the detected tempo">reset</button>' : ''}</span>`;
   const stars = e.isDirectory ? '' : (i === sel || s?.stars ? starsHtml(e.path) : '');
-  return `<div class="row${i === sel ? ' sel' : ''}${playing ? ' playing' : ''}" data-i="${i}"><span class="icon">${e.isDirectory ? '▸' : '♪'}</span><span class="text"><div class="name"></div>${e.sub ? '<div class="sub"></div>' : ''}</span>${dot}${stars}${tools}<span class="bpm">${badgeHtml(e)}</span></div>`;
+  return `<div class="row${i === sel ? ' sel' : ''}${playing ? ' playing' : ''}" data-i="${i}"${e.isDirectory ? '' : ' draggable="true" title="Drag onto a track in LUNA, or onto empty space for a new track"'}><span class="icon">${e.isDirectory ? '▸' : '♪'}</span><span class="text"><div class="name"></div>${e.sub ? '<div class="sub"></div>' : ''}</span>${dot}${stars}${tools}<span class="bpm">${badgeHtml(e)}</span></div>`;
 }
 
 function fillText(row, e) {
@@ -308,19 +308,25 @@ function cycleColour(e) {
 }
 
 // ---------- audition ----------
-async function audition(e) {
-  if (!session || !previewer) return status('Open a session in LUNA first.');
+/** The tempo rule for a file (name, your ½×/2× fix, LUNA's analysis), as resolveTempo's input. */
+async function tempoFor(e) {
   const [lo, hi] = rangeOf();
   if (!P.overrides[e.path] && !L.nameBpm(e.name) && P.detected[e.path] === undefined) {
     P.detected[e.path] = await L.detectTempo(luna, e.path);
     prefs.save();
   }
+  return (seconds) => L.resolveTempo({ name: e.name, seconds, detected: P.detected[e.path], override: P.overrides[e.path], range: [lo, hi] });
+}
+
+async function audition(e) {
+  if (!session || !previewer) return status('Open a session in LUNA first.');
+  if (dropsPending) { status('Finishing the drop…'); await Promise.race([dropChain, pause(30000)]); }
+  previewer.held = false; // a drag that never reported its end must not hold the preview
+  const rule = await tempoFor(e);
   const was = previewer.current?.path;
   status(`Loading ${e.name}…`);
   try {
-    const cur = await previewer.audition(e, (seconds) => L.resolveTempo({
-      name: e.name, seconds, detected: P.detected[e.path], override: P.overrides[e.path], range: [lo, hi],
-    }));
+    const cur = await previewer.audition(e, rule);
     const p = cur.plan;
     const s = stat(e.path);
     s.plays = (s.plays ?? 0) + 1;
@@ -375,6 +381,172 @@ async function addSample({ toSelected = false } = {}) {
   } catch (err) { status(`Couldn't add ${cur.name}: ${err.code ?? err.message}`); }
 }
 
+const DRAG_PICTURE_H = 20;
+
+/** The drag picture: the sample's name on a small tab, with an accent bar on its left edge. */
+function dragPicture(name) {
+  const c = document.createElement('canvas');
+  const ctx = c.getContext('2d');
+  const font = '12px -apple-system, Helvetica, sans-serif';
+  ctx.font = font;
+  const w = Math.min(260, Math.ceil(ctx.measureText(name).width) + 16);
+  c.width = w; c.height = DRAG_PICTURE_H; // resizing clears the context's settings
+  ctx.fillStyle = 'rgba(42, 38, 24, 0.92)';
+  ctx.fillRect(0, 0, w, DRAG_PICTURE_H);
+  ctx.fillStyle = '#F7C449';
+  ctx.fillRect(0, 0, 2, DRAG_PICTURE_H);
+  ctx.font = font;
+  ctx.fillStyle = '#ddd';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(name, 8, DRAG_PICTURE_H / 2 + 1, w - 12);
+  const img = new Image();
+  img.src = c.toDataURL();
+  return img;
+}
+
+// ---------- drag onto LUNA's timeline ----------
+// LUNA places a dropped file itself: snapped to a bar, with its own warp mode (a file the preview
+// already brought in gets none, shown as Polyphonic) and its own tempo guess. So once LUNA has
+// placed it, the browser undoes LUNA's drop and puts the sample there itself, as New track /
+// To track would: Sample Preview's warp mode, the browser's tempo, at the bar LUNA chose. It only
+// does that when the newest undo entries are exactly LUNA's drop; otherwise it leaves it alone.
+const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function undoUid() {
+  const n = await luna.raw.get(session.path, { children: false, commands: false, propfilter: 'undo_uid', flatvalue: true });
+  return n?.properties?.undo_uid;
+}
+
+/** LUNA's undo list, oldest first: [{ rowid, uid, name }]. */
+async function undoEntries() {
+  // levels: 2, or LUNA leaves out the entries' properties (measured 2026-11-26).
+  const q = await luna.raw.get(`${session.path}/undo_queues`, { levels: 2, properties: true, commands: false, propfilter: ['rowid', 'uid', 'name'], flatvalue: true });
+  return (q?.children ?? []).map((c) => c.properties ?? {}).filter((p) => typeof p.rowid === 'number').sort((x, y) => x.rowid - y.rowid);
+}
+
+/** Paths of the clips on a track's current playlist. */
+async function clipPaths(track) {
+  const n = await luna.raw.get(track.path, { children: false, commands: false, propfilter: 'playlist_uid', flatvalue: true });
+  const pl = n?.properties?.playlist_uid;
+  if (!pl) return [];
+  const base = `${session.path}/playlists/${pl}/clips`;
+  const c = await luna.raw.get(base, { levels: 1, properties: false, commands: false }).catch(() => null);
+  return (c?.children ?? []).map((k) => `${base}/${k.path}`);
+}
+
+/**
+ * What the session looks like when a sample row is pressed, to tell LUNA's drop apart later.
+ * It is taken before the drag begins and writes nothing: LUNA can be slow to answer while a
+ * drag is on, and a snapshot that finished after the drop would hide it (seen 2026-11-26).
+ * The undo position is read first; if it moved while the clips were listed, the clip list
+ * may already hold something new, so it is marked as not sure.
+ */
+async function dropSnapshot() {
+  const tracks = new Set(session.tracks.items.map((t) => t.id));
+  const [entries, uid] = await Promise.all([undoEntries(), undoUid()]);
+  const clips = new Map();
+  await L.mapLimit(session.tracks.items, 8, async (t) => clips.set(t.id, new Set(await clipPaths(t))));
+  const clipsSure = (await undoUid()) === uid;
+  const sources = session.sources ?? (await session.loadSources().catch(() => null));
+  const lastRow = entries.at(-1)?.rowid ?? -1;
+  return { lastRow, undoUid: uid, tracks, clips, clipsSure, sources: sources ? new Set(sources.items.map((x) => x.id)) : null };
+}
+
+/**
+ * The clip LUNA made from `file` since `snap`: { track, isNew, start, fresh, at } or null.
+ * The newest clip named after the file that wasn't there on the press (LUNA names a drop
+ * after its file, with "-48k" and the like added when it converts it); when the clip list
+ * isn't sure, the newest such clip of all.
+ */
+async function findDropped(snap, file) {
+  const stem = file.name.replace(/\.[^.]+$/, '').toLowerCase();
+  const own = new Set(previewer.clipUids);
+  let best = null;
+  for (const t of session.tracks.items) {
+    const before = snap.clipsSure ? (snap.clips.get(t.id) ?? new Set()) : new Set();
+    for (const path of await clipPaths(t)) {
+      if (before.has(path)) continue;
+      const c = (await luna.raw.get(path, { children: false, commands: false, propfilter: ['uid', 'name', 'start', 'source_uid', 'rowid'], flatvalue: true }))?.properties ?? {};
+      if (own.has(c.uid) || !String(c.name ?? '').toLowerCase().startsWith(stem)) continue;
+      if (!best || (c.rowid ?? 0) > (best.c.rowid ?? 0)) best = { t, c };
+    }
+  }
+  if (!best) return null;
+  const { t, c } = best;
+  // A file already in the session is reused (no analysis); a fresh import gets LUNA's
+  // instrument detection, a second undo entry that is worth waiting for.
+  const fresh = snap.sources ? !snap.sources.has(c.source_uid) : c.source_uid !== previewer.sources.get(file.path);
+  return { track: t, isNew: !snap.tracks.has(t.id), start: c.start, fresh, at: Date.now() };
+}
+
+// Drops are handled one after another. While a drag is on and a drop is being handled, the
+// preview adds nothing (previewer.held) and auditions wait: a preview's undo entry landing
+// after LUNA's drop would stop the swap.
+let dropChain = Promise.resolve();
+let dropsPending = 0;
+function dropped(file, snapPromise, effect) {
+  dropsPending++;
+  const run = dropChain.then(() => settleDrop(file, snapPromise, effect)).finally(() => {
+    dropsPending--;
+    if (!dropsPending && previewer) previewer.held = false;
+  });
+  dropChain = run.catch(() => undefined);
+  return run;
+}
+
+/**
+ * A sample row was dragged out and let go. Wait for LUNA to place it and go quiet, then swap
+ * LUNA's drop for the browser's own placement, which also ends the preview. A cancelled drag
+ * leaves the preview playing.
+ */
+async function settleDrop(file, snapPromise, effect) {
+  let swapped = false;
+  const auditioned = previewer?.current?.path;
+  try {
+    const snap = await Promise.race([snapPromise, pause(8000).then(() => null)]).catch(() => null);
+    if (!snap || !session || !previewer) return status(`Couldn't follow the drop of ${file.name}: it's left as LUNA made it.`);
+    const until = Date.now() + (effect === 'none' ? 3000 : 20000); // LUNA may ask about tempo first
+    let last = snap.undoUid, quietSince = Date.now(), found = null, entries = [];
+    while (Date.now() < until) {
+      await pause(150);
+      const u = await undoUid().catch(() => last);
+      if (u !== last) {
+        last = u;
+        quietSince = Date.now();
+        entries = (await undoEntries()).filter((x) => x.rowid > snap.lastRow);
+      }
+      // Once anything has changed, keep looking: LUNA may list the clip a moment after its entry.
+      if (!found && last !== snap.undoUid) found = await findDropped(snap, file);
+      if (!found) continue;
+      const detecting = found.fresh && !entries.some((x) => x.name === L.DETECT_UNDO_NAME) && Date.now() - found.at < 4000;
+      if (!detecting && Date.now() - quietSince > 700) break;
+    }
+    if (!found) return status(effect === 'none' ? `Drag cancelled: drop ${file.name} onto LUNA's timeline.` : `Couldn't see where LUNA put ${file.name}.`);
+    const n = L.dropUndoCount(entries.map((x) => x.name));
+    if (!n || (await undoUid()) !== last) return status(`LUNA placed ${file.name}; other changes came in, so it's left as LUNA made it.`);
+    const keep = entries.length > n ? entries[entries.length - n - 1].uid : snap.undoUid;
+    await session.undo(n);
+    for (let i = 0; i < 20 && (await undoUid()) !== keep; i++) await pause(50);
+    if ((await undoUid()) !== keep) return status(`Undoing LUNA's drop of ${file.name} didn't go as expected: check the undo list.`);
+    const target = found.isNew || found.track.name.value === L.PREVIEW_TRACK_NAME ? null : found.track;
+    const placed = await previewer.placeAt(file, await tempoFor(file), { track: target, startTick: found.start, loopsOnBar: true, stopPreview: true });
+    swapped = true;
+    const st = stat(file.path);
+    st.adds = (st.adds ?? 0) + 1;
+    st.kind = placed.plan.kind;
+    prefs.save();
+    const bar = session.musical.timeline.barBeat(placed.startTick).bar;
+    status(`Added ${file.name} to “${placed.track.name.value ?? ''}” at bar ${bar}${placed.plan.kind === 'loop' ? ` · ${placed.plan.bpm.toFixed(1)} BPM` : ' · one-shot'}`);
+  } catch (err) {
+    status(`Couldn't finish the drop of ${file.name}: ${err.code ?? err.message}`);
+  } finally {
+    // A drop left as LUNA made it still ends the preview, as Add does (keeping the transport).
+    const was = previewer?.current?.path;
+    if (!swapped && was && effect !== 'none') await previewer.stop({ stopTransport: false, onlyOwn: true }).catch(() => undefined);
+    for (const x of shown) if (x.path === was || x.path === auditioned || x.path === file.path) paintRow(x);
+  }
+}
+
 function retempo(e, factor) {
   const b = badgeFor(e);
   const cur = previewer?.current?.path === e.path ? previewer.current.plan.bpm : b.bpm;
@@ -418,6 +590,8 @@ function wireUi() {
   $('add').onclick = () => addSample();
   $('addSel').onclick = () => addSample({ toSelected: true });
   $('help-btn').onclick = () => $('help').classList.toggle('on');
+  // LUNA only reloads an Add On page when it restarts: double-click the status line instead.
+  $('status').ondblclick = () => location.reload();
   $('help').onclick = () => $('help').classList.remove('on');
 
   $('list').onclick = (ev) => {
@@ -456,6 +630,37 @@ function wireUi() {
       C: () => cycleColour(e),
     }[key] ?? (/^[0-5]$/.test(key) ? () => rate(e, Number(key)) : null);
     if (handled) { ev.preventDefault(); handled(); }
+  });
+
+  // Drag a sample out onto LUNA's timeline. LUNA places the clip itself (SDK fact 241): on a
+  // track's lane at the drop point, elsewhere on a new track.
+  // The drag picture is a small label with its left edge at the pointer: WebKit's own picture
+  // of the whole row sits left of the pointer by wherever you grabbed the row. It is made on
+  // pointer down, so it has loaded by the time the drag starts. The session snapshot that
+  // tells LUNA's drop apart is taken on pointer down too, before any drag (see dropSnapshot).
+  let dragging = null, picture = null, snapshot = Promise.resolve(null);
+  $('list').addEventListener('pointerdown', (ev) => {
+    const row = ev.target.closest?.('.row');
+    const e = row && shown[Number(row.dataset.i)];
+    const audio = e && !e.isDirectory && ev.button === 0;
+    picture = audio ? dragPicture(e.name.replace(/\.[^.]+$/, '')) : null;
+    snapshot = audio && session && previewer ? dropSnapshot() : Promise.resolve(null);
+    snapshot.catch(() => undefined); // most presses are clicks: nobody waits on it
+  });
+  $('list').addEventListener('dragstart', (ev) => {
+    const row = ev.target.closest?.('.row');
+    const e = row && shown[Number(row.dataset.i)];
+    if (!e || e.isDirectory) return ev.preventDefault();
+    try { Luna.startSourceDrag(ev, { path: e.path }); dragging = e; } catch { return ev.preventDefault(); }
+    if (picture?.complete && picture.naturalWidth) ev.dataTransfer.setDragImage(picture, 0, DRAG_PICTURE_H / 2);
+    // Nothing is written while the drag is on: the preview keeps playing but adds nothing.
+    if (previewer) previewer.held = true;
+  });
+  $('list').addEventListener('dragend', (ev) => {
+    const e = dragging;
+    dragging = null;
+    if (e) dropped(e, snapshot, ev.dataTransfer?.dropEffect ?? 'unknown');
+    else if (previewer && !dropsPending) previewer.held = false;
   });
 
   // Drop a folder (or a sample) from Finder onto the panel.
